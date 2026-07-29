@@ -1,0 +1,12 @@
+.DS_Store
+__pycache__/
+*.py[cod]
+
+# Local captures and generated datasets/results.
+captures/
+outputs/
+*.MOV
+*.mov
+*.MP4
+*.mp4
+*.mkv
