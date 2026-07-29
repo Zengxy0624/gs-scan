@@ -10,20 +10,26 @@ video -> sampled images -> PyCOLMAP cameras/sparse model -> gsplat training
 This repository intentionally contains no semantic-mapping or VGGT-omega code.
 Frame extraction is a lightweight OpenCV step.
 
+This standalone pipeline was extracted from the 3DGS path in
+[gxywang/3dmap](https://github.com/gxywang/3dmap) at commit `134ed07`.
+Its setup versions and server-operation safeguards are intentionally kept
+aligned with that reference pipeline.
+
 ## Repository layout
 
 ```text
-3dgs/
+3DGS-Health/
 ├── scripts/
 │   ├── extract_frames.py   # video -> dataset/images/*.jpg
 │   ├── prepare_colmap.py   # images -> database.db + sparse/0
 │   └── setup_gsplat.sh     # pinned server environment
+├── tests/                   # local-safe regression and smoke tests
 └── third-party/
     └── gsplat/             # official pinned Git submodule
 ```
 
-The three scripts are project-owned. `third-party/gsplat` is an unmodified
-checkout of the official
+The three scripts and tests are project-owned. `third-party/gsplat` is an
+unmodified checkout of the official
 [nerfstudio-project/gsplat](https://github.com/nerfstudio-project/gsplat)
 repository, pinned by this repository's Git commit. Training and viewing call
 its upstream example programs directly.
@@ -68,8 +74,13 @@ The unchanged environment policy carried over from `3dmap` defaults to:
 To match a CUDA 12.8 server instead:
 
 ```bash
+uv venv --clear --python 3.11 third-party/gsplat/.venv
 GSPLAT_TORCH_BACKEND=cu128 bash scripts/setup_gsplat.sh
 ```
+
+Always clear the existing environment before changing CUDA backends. Otherwise,
+the unchanged `torch==2.9.1` requirement or an existing compiled gsplat
+extension may leave the previous backend installed.
 
 Keep `--no-sync` on the commands below. It prevents `uv` from trying to
 reconcile the deliberately assembled upstream environment.
@@ -200,7 +211,7 @@ trajectory video, and a PLY when `--save_ply` is enabled.
 On a machine where the viewer port is accessible:
 
 ```bash
-uv run --project third-party/gsplat --no-sync \
+CUDA_VISIBLE_DEVICES=0 uv run --project third-party/gsplat --no-sync \
   python third-party/gsplat/examples/simple_viewer.py \
   --ckpt outputs/ambulance_v1/ckpts/ckpt_29999_rank0.pt \
   --output_dir outputs/ambulance_v1/viewer \
@@ -210,6 +221,21 @@ uv run --project third-party/gsplat --no-sync \
 Confirm the actual checkpoint filename with
 `ls outputs/ambulance_v1/ckpts/`. On a remote server, forward the port over SSH
 instead of exposing it publicly.
+
+## Local smoke tests
+
+After setup, the lightweight project-owned tests can run without starting
+training:
+
+```bash
+uv run --project third-party/gsplat --no-sync \
+  python -m unittest discover -s tests -v
+```
+
+The extraction integration test uses OpenCV from the gsplat environment and
+writes only to a temporary directory. COLMAP orchestration is tested with an
+in-memory stand-in; real reconstruction still belongs in the server validation
+run.
 
 ## What was intentionally excluded
 
