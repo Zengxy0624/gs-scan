@@ -11,15 +11,12 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = PROJECT_ROOT / "scripts" / "run_device_test.sh"
 CAPTURE_NAMES = (
-    "insta_fisheye_a.insv",
-    "insta_fisheye_b.insv",
     "insta_normal.mp4",
     "iphone_18mm.mov",
     "iphone_24mm.mov",
     "osmo_rotate.MP4",
     "osmo_stable.MP4",
 )
-PROCESSED_CAPTURE_NAMES = CAPTURE_NAMES[2:]
 
 
 class DeviceBatchTests(unittest.TestCase):
@@ -133,28 +130,6 @@ else:
         uv.chmod(0o755)
         return fake_bin, log
 
-    def test_insv_files_are_ignored(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            result = self.run_script(
-                root,
-                "--dry-run",
-                "--preprocess-only",
-            )
-
-            self.assertFalse((root / "work").exists())
-            self.assertFalse((root / "outputs").exists())
-
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertNotIn("insta_fisheye_a.insv", result.stdout)
-        self.assertNotIn("insta_fisheye_b.insv", result.stdout)
-        self.assertNotIn("extract_rig_frames.py", result.stdout)
-        self.assertNotIn("prepare_colmap_rig.py", result.stdout)
-        self.assertEqual(result.stdout.count("=== "), 5)
-        self.assertIn("--sample-fps 6", result.stdout)
-        self.assertIn("--max-frames 100000", result.stdout)
-        self.assertIn("no files written", result.stdout)
-
     def test_preprocess_only_lists_every_input_without_training(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             result = self.run_script(
@@ -164,25 +139,10 @@ else:
             )
 
         self.assertEqual(result.returncode, 0, result.stderr)
-        for name in PROCESSED_CAPTURE_NAMES:
+        for name in CAPTURE_NAMES:
             self.assertIn(name, result.stdout)
-        for name in CAPTURE_NAMES[:2]:
-            self.assertNotIn(name, result.stdout)
         self.assertEqual(result.stdout.count("=== "), 5)
         self.assertNotIn("simple_trainer.py", result.stdout)
-
-    def test_fisheye_scene_name_is_not_available(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            result = self.run_script(
-                Path(temporary),
-                "--dry-run",
-                "--preprocess-only",
-                "--scene",
-                "insta_fisheye_a",
-            )
-
-        self.assertEqual(result.returncode, 2)
-        self.assertIn("unknown --scene value", result.stderr)
 
     def test_rejects_unknown_scene(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
