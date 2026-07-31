@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sys
 import tempfile
 import types
@@ -7,7 +8,11 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from scripts.prepare_colmap import _validate_input, reconstruct
+from scripts.prepare_colmap import (
+    _minimum_registered_images,
+    _validate_input,
+    reconstruct,
+)
 
 
 class InputValidationTests(unittest.TestCase):
@@ -50,6 +55,16 @@ class InputValidationTests(unittest.TestCase):
             with self.assertRaises(FileExistsError):
                 _validate_input(dataset, overlap=15)
 
+    def test_registration_threshold_requires_ratio_and_ten_images(self) -> None:
+        self.assertEqual(_minimum_registered_images(12, 0.5), 10)
+        self.assertEqual(_minimum_registered_images(20, 0.75), 15)
+        self.assertEqual(_minimum_registered_images(21, 0.5), 11)
+
+        for invalid_ratio in (0.0, -0.1, 1.1, float("nan")):
+            with self.subTest(invalid_ratio=invalid_ratio):
+                with self.assertRaises(ValueError):
+                    _minimum_registered_images(20, invalid_ratio)
+
 
 class FakeReconstruction:
     def __init__(self, registered: int, points: int) -> None:
@@ -74,13 +89,21 @@ class OrchestrationTests(unittest.TestCase):
     def test_runs_expected_pycolmap_pipeline_and_selects_largest_model(self) -> None:
         calls: list[tuple[str, dict[str, object]]] = []
         smaller = FakeReconstruction(registered=2, points=10)
-        larger = FakeReconstruction(registered=5, points=50)
+        larger = FakeReconstruction(registered=10, points=50)
 
         class ImageReaderOptions:
             def __init__(self, **kwargs: object) -> None:
                 self.kwargs = kwargs
 
         class SequentialPairingOptions:
+            def __init__(self, **kwargs: object) -> None:
+                self.kwargs = kwargs
+
+        class FeatureExtractionOptions:
+            def __init__(self, **kwargs: object) -> None:
+                self.kwargs = kwargs
+
+        class FeatureMatchingOptions:
             def __init__(self, **kwargs: object) -> None:
                 self.kwargs = kwargs
 
@@ -94,8 +117,11 @@ class OrchestrationTests(unittest.TestCase):
         fake_pycolmap = types.SimpleNamespace(
             __version__="test",
             CameraMode=types.SimpleNamespace(SINGLE="single"),
+            Device=types.SimpleNamespace(cpu="cpu"),
             ImageReaderOptions=ImageReaderOptions,
             SequentialPairingOptions=SequentialPairingOptions,
+            FeatureExtractionOptions=FeatureExtractionOptions,
+            FeatureMatchingOptions=FeatureMatchingOptions,
             extract_features=record("extract_features"),
             match_sequential=record("match_sequential"),
             incremental_mapping=record(
@@ -108,14 +134,15 @@ class OrchestrationTests(unittest.TestCase):
             dataset = Path(temporary).resolve()
             images = dataset / "images"
             images.mkdir()
-            (images / "000000.jpg").write_bytes(b"image")
-            (images / "000001.jpg").write_bytes(b"image")
+            for index in range(12):
+                (images / f"{index:06d}.jpg").write_bytes(b"image")
 
             with patch.dict(sys.modules, {"pycolmap": fake_pycolmap}):
                 model_path = reconstruct(
                     dataset,
                     overlap=9,
-                    camera_model="SIMPLE_RADIAL",
+                    camera_model="OPENCV_FISHEYE",
+                    num_threads=6,
                 )
 
             self.assertEqual(model_path, dataset / "sparse" / "0")
@@ -136,19 +163,127 @@ class OrchestrationTests(unittest.TestCase):
             self.assertEqual(extract_call["camera_mode"], "single")
             self.assertEqual(
                 extract_call["reader_options"].kwargs,
-                {"camera_model": "SIMPLE_RADIAL"},
+                {"camera_model": "OPENCV_FISHEYE"},
+            )
+            self.assertEqual(extract_call["camera_model"], "OPENCV_FISHEYE")
+            self.assertEqual(extract_call["device"], "cpu")
+            self.assertEqual(
+                extract_call["extraction_options"].kwargs,
+                {"num_threads": 6},
             )
 
             match_call = calls[1][1]
             self.assertEqual(
                 match_call["pairing_options"].kwargs,
-                {"overlap": 9},
+                {"overlap": 9, "quadratic_overlap": False},
             )
+            self.assertEqual(
+                match_call["matching_options"].kwargs,
+                {"num_threads": 6, "use_gpu": False},
+            )
+            self.assertEqual(match_call["device"], "cpu")
 
             mapping_call = calls[2][1]
             self.assertEqual(mapping_call["database_path"], dataset / "database.db")
             self.assertEqual(mapping_call["image_path"], images)
             self.assertEqual(mapping_call["output_path"], dataset / "sparse")
+
+            with (dataset / "reconstruction_stats.json").open(
+                encoding="utf-8"
+            ) as stats_file:
+                stats = json.load(stats_file)
+            self.assertEqual(
+                stats,
+                {
+                    "camera_model": "OPENCV_FISHEYE",
+                    "minimum_registered_images": 10,
+                    "minimum_registration_ratio": 0.5,
+                    "num_input_images": 12,
+                    "num_points3D": 50,
+                    "num_registered_images": 10,
+                    "registration_ratio": 10 / 12,
+                    "selected_model_id": 1,
+                    "status": "passed",
+                },
+            )
+
+    def test_fails_quality_gate_and_records_diagnostics(self) -> None:
+        calls: list[tuple[str, dict[str, object]]] = []
+        weak = FakeReconstruction(registered=9, points=40)
+
+        class Options:
+            def __init__(self, **kwargs: object) -> None:
+                self.kwargs = kwargs
+
+        def record(name: str, result: object = None):
+            def function(**kwargs: object) -> object:
+                calls.append((name, kwargs))
+                return result
+
+            return function
+
+        fake_pycolmap = types.SimpleNamespace(
+            __version__="test",
+            CameraMode=types.SimpleNamespace(SINGLE="single"),
+            Device=types.SimpleNamespace(cpu="cpu"),
+            ImageReaderOptions=Options,
+            SequentialPairingOptions=Options,
+            FeatureExtractionOptions=Options,
+            FeatureMatchingOptions=Options,
+            extract_features=record("extract_features"),
+            match_sequential=record("match_sequential"),
+            incremental_mapping=record("incremental_mapping", {7: weak}),
+        )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            dataset = Path(temporary).resolve()
+            images = dataset / "images"
+            images.mkdir()
+            for index in range(20):
+                (images / f"{index:06d}.jpg").write_bytes(b"image")
+
+            with patch.dict(sys.modules, {"pycolmap": fake_pycolmap}):
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    r"9/20 images registered.*need at least 10",
+                ):
+                    reconstruct(
+                        dataset,
+                        overlap=9,
+                        camera_model="SIMPLE_RADIAL",
+                        num_threads=2,
+                    )
+
+            self.assertIsNone(weak.written_to)
+            with (dataset / "reconstruction_stats.json").open(
+                encoding="utf-8"
+            ) as stats_file:
+                stats = json.load(stats_file)
+            self.assertEqual(stats["status"], "failed")
+            self.assertEqual(stats["num_registered_images"], 9)
+            self.assertEqual(stats["minimum_registered_images"], 10)
+
+    def test_rejects_invalid_thread_count_before_importing_pycolmap(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            dataset = Path(temporary)
+            with self.assertRaises(ValueError):
+                reconstruct(
+                    dataset,
+                    overlap=9,
+                    camera_model="SIMPLE_RADIAL",
+                    num_threads=0,
+                )
+
+    def test_rejects_invalid_registration_ratio_before_importing_pycolmap(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            dataset = Path(temporary)
+            with self.assertRaises(ValueError):
+                reconstruct(
+                    dataset,
+                    overlap=9,
+                    camera_model="SIMPLE_RADIAL",
+                    min_registration_ratio=0.0,
+                )
 
 
 if __name__ == "__main__":

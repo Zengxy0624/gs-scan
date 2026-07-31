@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import argparse
+import json
+import math
+import os
 import sys
 from pathlib import Path
 from typing import Sequence
@@ -42,6 +45,24 @@ def build_parser() -> argparse.ArgumentParser:
         ),
         help="Shared COLMAP camera model for all video frames.",
     )
+    parser.add_argument(
+        "--num-threads",
+        type=int,
+        default=-1,
+        help=(
+            "Maximum CPU threads for feature extraction and matching; "
+            "-1 lets COLMAP use all available threads (default: -1)."
+        ),
+    )
+    parser.add_argument(
+        "--min-registration-ratio",
+        type=float,
+        default=0.5,
+        help=(
+            "Fail unless the largest sparse model registers at least this "
+            "fraction of input images and at least 10 images (default: 0.5)."
+        ),
+    )
     return parser
 
 
@@ -59,7 +80,9 @@ def _validate_input(dataset: Path, overlap: int) -> tuple[Path, list[Path]]:
         if path.is_file() and path.suffix.lower() in IMAGE_SUFFIXES
     )
     if len(images) < 2:
-        raise ValueError(f"Need at least two images in {image_dir}; found {len(images)}")
+        raise ValueError(
+            f"Need at least two images in {image_dir}; found {len(images)}"
+        )
 
     database_path = dataset / "database.db"
     sparse_path = dataset / "sparse"
@@ -77,11 +100,54 @@ def _validate_input(dataset: Path, overlap: int) -> tuple[Path, list[Path]]:
     return image_dir, images
 
 
-def reconstruct(dataset: Path, overlap: int, camera_model: str) -> Path:
+def _minimum_registered_images(
+    total_images: int,
+    min_registration_ratio: float,
+) -> int:
+    if not 0.0 < min_registration_ratio <= 1.0:
+        raise ValueError(
+            "--min-registration-ratio must be greater than 0 and at most 1"
+        )
+    return max(10, math.ceil(total_images * min_registration_ratio))
+
+
+def _write_reconstruction_stats(dataset: Path, stats: dict[str, object]) -> Path:
+    stats_path = dataset / "reconstruction_stats.json"
+    temporary_path = dataset / f".{stats_path.name}.tmp"
+    try:
+        with temporary_path.open("w", encoding="utf-8") as stats_file:
+            json.dump(stats, stats_file, indent=2, sort_keys=True)
+            stats_file.write("\n")
+            stats_file.flush()
+            os.fsync(stats_file.fileno())
+        os.replace(temporary_path, stats_path)
+    finally:
+        temporary_path.unlink(missing_ok=True)
+    return stats_path
+
+
+def reconstruct(
+    dataset: Path,
+    overlap: int,
+    camera_model: str,
+    num_threads: int = -1,
+    min_registration_ratio: float = 0.5,
+) -> Path:
+    if num_threads == 0 or num_threads < -1:
+        raise ValueError("--num-threads must be -1 or a positive integer")
+    _minimum_registered_images(
+        total_images=0,
+        min_registration_ratio=min_registration_ratio,
+    )
+
     import pycolmap
 
     dataset = dataset.expanduser().resolve()
     image_dir, images = _validate_input(dataset, overlap)
+    minimum_registered = _minimum_registered_images(
+        total_images=len(images),
+        min_registration_ratio=min_registration_ratio,
+    )
     database_path = dataset / "database.db"
     sparse_path = dataset / "sparse"
     sparse_path.mkdir(parents=True, exist_ok=True)
@@ -89,18 +155,31 @@ def reconstruct(dataset: Path, overlap: int, camera_model: str) -> Path:
     print(f"PyCOLMAP {pycolmap.__version__}")
     print(f"Extracting features from {len(images)} images in {image_dir}")
     reader_options = pycolmap.ImageReaderOptions(camera_model=camera_model)
+    extraction_options = pycolmap.FeatureExtractionOptions(num_threads=num_threads)
     pycolmap.extract_features(
         database_path=database_path,
         image_path=image_dir,
         camera_mode=pycolmap.CameraMode.SINGLE,
+        camera_model=camera_model,
         reader_options=reader_options,
+        extraction_options=extraction_options,
+        device=pycolmap.Device.cpu,
     )
 
     print(f"Sequentially matching with overlap={overlap}")
-    pairing_options = pycolmap.SequentialPairingOptions(overlap=overlap)
+    pairing_options = pycolmap.SequentialPairingOptions(
+        overlap=overlap,
+        quadratic_overlap=False,
+    )
+    matching_options = pycolmap.FeatureMatchingOptions(
+        num_threads=num_threads,
+        use_gpu=False,
+    )
     pycolmap.match_sequential(
         database_path=database_path,
         pairing_options=pairing_options,
+        matching_options=matching_options,
+        device=pycolmap.Device.cpu,
     )
 
     print("Running incremental structure-from-motion")
@@ -115,31 +194,59 @@ def reconstruct(dataset: Path, overlap: int, camera_model: str) -> Path:
             "remove blurred frames, and rerun in a fresh output directory."
         )
 
-    reconstruction = max(
-        reconstructions.values(), key=lambda model: model.num_reg_images()
+    model_id, reconstruction = max(
+        reconstructions.items(),
+        key=lambda item: item[1].num_reg_images(),
     )
-    model_path = sparse_path / "0"
-    model_path.mkdir(parents=True, exist_ok=True)
-    reconstruction.write(model_path)
 
     registered = reconstruction.num_reg_images()
     points = reconstruction.num_points3D()
+    registration_ratio = registered / len(images)
+    passed_quality_gate = registered >= minimum_registered
+    stats = {
+        "camera_model": camera_model,
+        "minimum_registered_images": minimum_registered,
+        "minimum_registration_ratio": min_registration_ratio,
+        "num_input_images": len(images),
+        "num_points3D": points,
+        "num_registered_images": registered,
+        "registration_ratio": registration_ratio,
+        "selected_model_id": model_id,
+        "status": "passed" if passed_quality_gate else "failed",
+    }
+    stats_path = _write_reconstruction_stats(dataset, stats)
+
     print(reconstruction.summary())
     print(f"Selected largest model: {registered}/{len(images)} registered images")
     print(f"Sparse points: {points}")
-    print(f"gsplat COLMAP model: {model_path}")
-    if registered < max(10, len(images) // 2):
-        print(
-            "Warning: relatively few frames registered. Inspect capture overlap "
-            "before committing to a full gsplat training run."
+    print(f"Reconstruction stats: {stats_path}")
+    if not passed_quality_gate:
+        raise RuntimeError(
+            "COLMAP registration quality gate failed: "
+            f"{registered}/{len(images)} images registered "
+            f"({registration_ratio:.1%}); need at least {minimum_registered} "
+            f"images ({min_registration_ratio:.1%} requested). "
+            "Inspect capture overlap, blur, and camera settings, then rerun in "
+            "a fresh output directory."
         )
+
+    model_path = sparse_path / "0"
+    model_path.mkdir(parents=True, exist_ok=True)
+    reconstruction.write(model_path)
+    print(f"gsplat COLMAP model: {model_path}")
     return model_path
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
-        reconstruct(args.dataset, args.overlap, args.camera_model)
+        reconstruct(
+            args.dataset,
+            args.overlap,
+            args.camera_model,
+            args.num_threads,
+            args.min_registration_ratio,
+        )
     except (ImportError, OSError, RuntimeError, ValueError) as error:
         print(f"error: {error}", file=sys.stderr)
         return 1

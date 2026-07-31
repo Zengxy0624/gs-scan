@@ -5,6 +5,7 @@ __pycache__/
 # Local captures and generated datasets/results.
 captures/
 outputs/
+work/
 *.MOV
 *.mov
 *.MP4

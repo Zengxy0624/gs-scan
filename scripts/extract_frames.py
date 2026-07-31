@@ -145,8 +145,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--max-frames",
         type=int,
-        default=1000,
-        help="Hard cap of at least 2 while spanning the full video (default: 1000).",
+        default=100000,
+        help=(
+            "Hard cap of at least 2 while spanning the full video "
+            "(default: 100000)."
+        ),
     )
     parser.add_argument(
         "--jpeg-quality",
@@ -180,6 +183,7 @@ def create_dataset(
         raise ValueError("--jpeg-quality must be between 1 and 100")
 
     dataset.parent.mkdir(parents=True, exist_ok=True)
+    source_stat = video.stat()
     temporary = Path(
         tempfile.mkdtemp(prefix=f".{dataset.name}.", dir=str(dataset.parent))
     )
@@ -192,7 +196,10 @@ def create_dataset(
             jpeg_quality,
         )
         metadata = {
+            "dataset_type": "single_video",
             "source_video": str(video),
+            "source_size_bytes": source_stat.st_size,
+            "source_mtime_ns": source_stat.st_mtime_ns,
             "sample_fps": sample_fps,
             "max_frames": max_frames,
             "jpeg_quality": jpeg_quality,

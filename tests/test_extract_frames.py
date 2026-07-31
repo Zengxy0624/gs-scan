@@ -140,6 +140,16 @@ class DatasetCreationTests(unittest.TestCase):
             ])
             self.assertTrue(all(path.stat().st_size > 0 for path in images))
             self.assertEqual(metadata["selected_indices"], [0, 7, 14, 22, 29])
+            self.assertEqual(metadata["dataset_type"], "single_video")
+            self.assertEqual(metadata["source_video"], str(video.resolve()))
+            self.assertEqual(
+                metadata["source_size_bytes"],
+                video.stat().st_size,
+            )
+            self.assertEqual(
+                metadata["source_mtime_ns"],
+                video.stat().st_mtime_ns,
+            )
             self.assertEqual(
                 (
                     metadata["output_frame_width"],
