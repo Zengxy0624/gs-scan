@@ -35,7 +35,7 @@ Options:
   --gpu ID                   Physical GPU used only for training (default: 6).
   --sample-fps FPS           Uniform video sampling rate (default: 6).
   --max-frames N             Maximum sampled frames per video (default: 100000).
-  --overlap N                COLMAP temporal match overlap (default: 15).
+  --overlap N                Dense COLMAP temporal match window (default: 15).
   --colmap-threads N         COLMAP CPU threads (default: 8; -1 means all).
   --min-registration-ratio R Fail weak COLMAP models below R (default: 0.5).
   --scene NAME               Run only one named scene.
@@ -142,7 +142,30 @@ case "${PROFILE}" in
         ;;
 esac
 
+normalize_decimal() {
+    local raw="$1"
+    local integer_part="${raw%%.*}"
+    local fractional_part=""
+    integer_part="$((10#${integer_part}))"
+    if [[ "${raw}" == *.* ]]; then
+        fractional_part="${raw#*.}"
+        while [[ "${fractional_part}" == *0 ]]; do
+            fractional_part="${fractional_part%0}"
+        done
+    fi
+    if [[ -n "${fractional_part}" ]]; then
+        printf '%s.%s\n' "${integer_part}" "${fractional_part}"
+    else
+        printf '%s\n' "${integer_part}"
+    fi
+}
+
 if [[ ! "${GPU_ID}" =~ ^[0-9]+$ ]]; then
+    echo "error: --gpu must be one non-negative integer GPU index" >&2
+    exit 2
+fi
+GPU_ID="$((10#${GPU_ID}))"
+if (( GPU_ID < 0 )); then
     echo "error: --gpu must be one non-negative integer GPU index" >&2
     exit 2
 fi
@@ -151,16 +174,34 @@ if [[ ! "${SAMPLE_FPS}" =~ ^([0-9]+)([.][0-9]+)?$ ]] ||
     echo "error: --sample-fps must be positive" >&2
     exit 2
 fi
-if [[ ! "${MAX_FRAMES}" =~ ^[0-9]+$ ]] || (( MAX_FRAMES < 2 )); then
+SAMPLE_FPS="$(normalize_decimal "${SAMPLE_FPS}")"
+if [[ ! "${MAX_FRAMES}" =~ ^[0-9]+$ ]]; then
     echo "error: --max-frames must be an integer of at least 2" >&2
     exit 2
 fi
-if [[ ! "${OVERLAP}" =~ ^[0-9]+$ ]] || (( OVERLAP < 1 )); then
+MAX_FRAMES="$((10#${MAX_FRAMES}))"
+if (( MAX_FRAMES < 2 )); then
+    echo "error: --max-frames must be an integer of at least 2" >&2
+    exit 2
+fi
+if [[ ! "${OVERLAP}" =~ ^[0-9]+$ ]]; then
     echo "error: --overlap must be a positive integer" >&2
     exit 2
 fi
-if [[ ! "${COLMAP_THREADS}" =~ ^-?[0-9]+$ ]] ||
-    (( COLMAP_THREADS == 0 || COLMAP_THREADS < -1 )); then
+OVERLAP="$((10#${OVERLAP}))"
+if (( OVERLAP < 1 )); then
+    echo "error: --overlap must be a positive integer" >&2
+    exit 2
+fi
+if [[ "${COLMAP_THREADS}" == "-1" ]]; then
+    :
+elif [[ "${COLMAP_THREADS}" =~ ^[0-9]+$ ]]; then
+    COLMAP_THREADS="$((10#${COLMAP_THREADS}))"
+else
+    echo "error: --colmap-threads must be -1 or a positive integer" >&2
+    exit 2
+fi
+if (( COLMAP_THREADS != -1 && COLMAP_THREADS < 1 )); then
     echo "error: --colmap-threads must be -1 or a positive integer" >&2
     exit 2
 fi
@@ -169,6 +210,7 @@ if [[ ! "${MIN_REGISTRATION_RATIO}" =~ ^(0([.][0-9]+)?|1([.]0+)?)$ ]] ||
     echo "error: --min-registration-ratio must be greater than 0 and at most 1" >&2
     exit 2
 fi
+MIN_REGISTRATION_RATIO="$(normalize_decimal "${MIN_REGISTRATION_RATIO}")"
 
 SCENES=(
     "insta_normal"
@@ -233,33 +275,66 @@ SUMMARY_PATH="${OUTPUT_BASE}/summary_${RUN_KEY}.tsv"
 RUN_TIMESTAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 LOCK_DIR="${WORK_EXPERIMENT}/.batch-lock"
 LOCK_ACQUIRED=0
+COLMAP_CACHE_VALID=0
 
 cleanup_lock() {
     if (( LOCK_ACQUIRED == 1 )) &&
         [[ -f "${LOCK_DIR}/pid" ]] &&
         [[ "$(<"${LOCK_DIR}/pid")" == "$$" ]]; then
-        rm -f "${LOCK_DIR}/pid" "${LOCK_DIR}/hostname"
+        rm -f "${LOCK_DIR}/pid" "${LOCK_DIR}/hostname" "${LOCK_DIR}/uid"
         rmdir "${LOCK_DIR}" 2>/dev/null || true
     fi
 }
 
+process_is_alive() {
+    local process_id="$1"
+    "${PROJECT_PYTHON}" - "${process_id}" <<'PY'
+import errno
+import os
+import sys
+
+try:
+    os.kill(int(sys.argv[1]), 0)
+except ProcessLookupError:
+    raise SystemExit(1)
+except PermissionError:
+    raise SystemExit(0)
+except OSError as error:
+    raise SystemExit(1 if error.errno == errno.ESRCH else 0)
+raise SystemExit(0)
+PY
+}
+
 acquire_lock() {
     local current_host
+    local current_uid
     local owner_host=""
     local owner_pid=""
+    local owner_uid=""
     local stale_lock=""
     current_host="$(hostname)"
+    current_uid="$(id -u)"
     mkdir -p "${WORK_EXPERIMENT}" "${OUTPUT_BASE}"
     if [[ -d "${LOCK_DIR}" ]]; then
         [[ -f "${LOCK_DIR}/hostname" ]] &&
             owner_host="$(<"${LOCK_DIR}/hostname")"
         [[ -f "${LOCK_DIR}/pid" ]] && owner_pid="$(<"${LOCK_DIR}/pid")"
-        if [[ -n "${owner_host}" ]] && [[ "${owner_host}" != "${current_host}" ]]; then
+        [[ -f "${LOCK_DIR}/uid" ]] && owner_uid="$(<"${LOCK_DIR}/uid")"
+        if [[ -z "${owner_host}" ]] || [[ ! "${owner_pid}" =~ ^[0-9]+$ ]]; then
+            echo "error: batch lock metadata is incomplete: ${LOCK_DIR}" >&2
+            echo "Verify that no batch is active before removing it manually." >&2
+            exit 1
+        fi
+        if [[ "${owner_host}" != "${current_host}" ]]; then
             echo "error: batch lock belongs to host ${owner_host}: ${LOCK_DIR}" >&2
             exit 1
         fi
-        if [[ "${owner_pid}" =~ ^[0-9]+$ ]] && kill -0 "${owner_pid}" 2>/dev/null; then
-            echo "error: another batch is active as PID ${owner_pid}: ${LOCK_DIR}" >&2
+        if process_is_alive "${owner_pid}"; then
+            if [[ -n "${owner_uid}" ]] && [[ "${owner_uid}" != "${current_uid}" ]]; then
+                echo "error: another user's batch is active as UID ${owner_uid}, PID ${owner_pid}: ${LOCK_DIR}" >&2
+            else
+                echo "error: another batch is active as PID ${owner_pid}: ${LOCK_DIR}" >&2
+            fi
             exit 1
         fi
         stale_lock="${LOCK_DIR}.stale-${RUN_TIMESTAMP}-$$"
@@ -269,6 +344,7 @@ acquire_lock() {
     mkdir "${LOCK_DIR}"
     printf '%s\n' "$$" > "${LOCK_DIR}/pid"
     printf '%s\n' "${current_host}" > "${LOCK_DIR}/hostname"
+    printf '%s\n' "${current_uid}" > "${LOCK_DIR}/uid"
     LOCK_ACQUIRED=1
     trap cleanup_lock EXIT
     trap 'exit 129' HUP
@@ -307,18 +383,26 @@ extraction_structurally_complete() {
 
 cache_matches_sources() {
     local dataset="$1"
-    shift
+    local source_video="$2"
+    local camera_model="$3"
+    local require_colmap="${4:-0}"
+    local validation_command=()
     extraction_structurally_complete "${dataset}" || return 1
-    "${PROJECT_PYTHON}" "${PROJECT_ROOT}/scripts/validate_dataset_cache.py" \
-        "${dataset}" "$@" \
-        --sample-fps "${SAMPLE_FPS}" \
+    validation_command=(
+        "${PROJECT_PYTHON}"
+        "${PROJECT_ROOT}/scripts/validate_dataset_cache.py"
+        "${dataset}" "${source_video}"
+        --sample-fps "${SAMPLE_FPS}"
         --max-frames "${MAX_FRAMES}"
-}
-
-stats_passed() {
-    local stats_path="$1"
-    [[ -s "${stats_path}" ]] &&
-        grep -q '"status": "passed"' "${stats_path}"
+        --camera-model "${camera_model}"
+        --overlap "${OVERLAP}"
+        --quadratic-overlap
+        --min-registration-ratio "${MIN_REGISTRATION_RATIO}"
+    )
+    if (( require_colmap == 1 )); then
+        validation_command+=(--require-colmap)
+    fi
+    "${validation_command[@]}"
 }
 
 sparse_model_complete() {
@@ -330,9 +414,12 @@ sparse_model_complete() {
 
 single_colmap_complete() {
     local dataset="$1"
+    local source_video="$2"
+    local camera_model="$3"
     [[ -s "${dataset}/database.db" ]] &&
         sparse_model_complete "${dataset}/sparse/0" &&
-        stats_passed "${dataset}/reconstruction_stats.json"
+        cache_matches_sources \
+            "${dataset}" "${source_video}" "${camera_model}" 1
 }
 
 training_artifacts_complete() {
@@ -346,11 +433,20 @@ training_artifacts_complete() {
 training_complete() {
     local result_dir="$1"
     local desired_manifest="$2"
+    local strict_snapshot="${3:-0}"
+    local compare_command=(
+        "${PROJECT_PYTHON}"
+        "${PROJECT_ROOT}/scripts/build_run_manifest.py"
+        compare
+        "${desired_manifest}"
+        "${result_dir}/pipeline_manifest.json"
+    )
+    if (( strict_snapshot == 1 )); then
+        compare_command+=(--strict-snapshot)
+    fi
     training_artifacts_complete "${result_dir}" &&
         [[ -s "${result_dir}/pipeline_manifest.json" ]] &&
-        cmp -s \
-            "${desired_manifest}" \
-            "${result_dir}/pipeline_manifest.json"
+        "${compare_command[@]}"
 }
 
 has_single_colmap_state() {
@@ -386,7 +482,9 @@ prepare_work_directory() {
     local scene="$1"
     local scene_work="$2"
     local source_video="$3"
+    local camera_model="$4"
     local dataset="${scene_work}/dataset"
+    COLMAP_CACHE_VALID=0
 
     if (( DRY_RUN == 1 )); then
         return 0
@@ -399,15 +497,18 @@ prepare_work_directory() {
             "${scene}" "${scene_work}" "incomplete extraction"
         return $?
     fi
-    if ! cache_matches_sources "${dataset}" "${source_video}"; then
+    if has_single_colmap_state "${dataset}"; then
+        if ! single_colmap_complete \
+            "${dataset}" "${source_video}" "${camera_model}"; then
+            handle_incomplete_work \
+                "${scene}" "${scene_work}" "stale or incomplete COLMAP state"
+            return $?
+        fi
+        COLMAP_CACHE_VALID=1
+    elif ! cache_matches_sources \
+        "${dataset}" "${source_video}" "${camera_model}"; then
         handle_incomplete_work \
-            "${scene}" "${scene_work}" "stale frame cache"
-        return $?
-    fi
-    if has_single_colmap_state "${dataset}" &&
-        ! single_colmap_complete "${dataset}"; then
-        handle_incomplete_work \
-            "${scene}" "${scene_work}" "incomplete COLMAP state"
+            "${scene}" "${scene_work}" "stale preprocessing cache"
         return $?
     fi
 }
@@ -427,7 +528,7 @@ prepare_output_directory() {
     fi
     if (( RETRY_INCOMPLETE == 0 )); then
         echo "error: incomplete or stale training result for ${scene}: ${result_dir}" >&2
-        echo "Its provenance does not match the current source, COLMAP model, or pipeline." >&2
+        echo "Its semantic identity does not match the current source, recipe, or trainer." >&2
         echo "Rerun with --retry-incomplete to archive and retrain it." >&2
         return 1
     fi
@@ -459,7 +560,8 @@ process_scene() {
     fi
 
     prepare_work_directory \
-        "${scene}" "${scene_work}" "${source_video}" || return 1
+        "${scene}" "${scene_work}" "${source_video}" \
+        "${camera_model}" || return 1
 
     if ! extraction_structurally_complete "${dataset}"; then
         run_command \
@@ -471,7 +573,9 @@ process_scene() {
     else
         echo "Skipping completed extraction: ${dataset}"
     fi
-    if ! single_colmap_complete "${dataset}"; then
+    if (( COLMAP_CACHE_VALID == 0 )) &&
+        ! single_colmap_complete \
+            "${dataset}" "${source_video}" "${camera_model}"; then
         run_command \
             uv run --project "${GSPLAT_ROOT}" --no-sync \
             python "${PROJECT_ROOT}/scripts/prepare_colmap.py" \
@@ -493,20 +597,19 @@ process_scene() {
     manifest_command=(
         "${PROJECT_PYTHON}"
         "${PROJECT_ROOT}/scripts/build_run_manifest.py"
+        build
         --scene "${scene}"
         --dataset "${dataset}"
         --source "${source_video}"
-        --pipeline-file "${PROJECT_ROOT}/scripts/extract_frames.py"
-        --pipeline-file "${PROJECT_ROOT}/scripts/prepare_colmap.py"
-        --pipeline-file "${PROJECT_ROOT}/scripts/validate_dataset_cache.py"
-        --pipeline-file "${PROJECT_ROOT}/scripts/build_run_manifest.py"
-        --pipeline-file "${PROJECT_ROOT}/scripts/run_device_test.sh"
-        --pipeline-file "${TRAINER}"
+        --gsplat-root "${GSPLAT_ROOT}"
         --sample-fps "${SAMPLE_FPS}"
         --max-frames "${MAX_FRAMES}"
         --overlap "${OVERLAP}"
         --min-registration-ratio "${MIN_REGISTRATION_RATIO}"
         --max-steps "${MAX_STEPS}"
+        --camera-model "${camera_model}"
+        --colmap-threads "${COLMAP_THREADS}"
+        --gpu-id "${GPU_ID}"
         --output "${desired_manifest}"
     )
     run_command "${manifest_command[@]}" || return 1
@@ -545,10 +648,15 @@ process_scene() {
     )
     run_command "${trainer_command[@]}" || return 1
 
-    if (( DRY_RUN == 0 )) &&
-        ! training_complete "${result_dir}" "${desired_manifest}"; then
-        echo "error: training finished without expected final artifacts" >&2
-        return 1
+    if (( DRY_RUN == 0 )); then
+        # Rebuild the manifest after training so external source/work mutations
+        # during a long job cannot be certified by the pre-training snapshot.
+        run_command "${manifest_command[@]}" || return 1
+        if ! training_complete \
+            "${result_dir}" "${desired_manifest}" 1; then
+            echo "error: training finished without matching final artifacts" >&2
+            return 1
+        fi
     fi
 }
 

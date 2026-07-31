@@ -1,13 +1,15 @@
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
 import math
 import tempfile
 import unittest
+import uuid
 from pathlib import Path
 
-from scripts.extract_frames import create_dataset, select_frame_indices
+from scripts.extract_frames import _tree_sha256, create_dataset, select_frame_indices
 
 
 class FrameSelectionTests(unittest.TestCase):
@@ -149,6 +151,15 @@ class DatasetCreationTests(unittest.TestCase):
             self.assertEqual(
                 metadata["source_mtime_ns"],
                 video.stat().st_mtime_ns,
+            )
+            self.assertEqual(
+                metadata["source_sha256"],
+                hashlib.sha256(video.read_bytes()).hexdigest(),
+            )
+            uuid.UUID(metadata["dataset_instance_id"])
+            self.assertEqual(
+                metadata["images_sha256"],
+                _tree_sha256(dataset / "images"),
             )
             self.assertEqual(
                 (

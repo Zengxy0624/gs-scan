@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -12,6 +13,17 @@ from typing import Sequence
 
 
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".webp"}
+
+
+def _file_identity(path: Path) -> dict[str, object]:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return {
+        "size_bytes": path.stat().st_size,
+        "sha256": digest.hexdigest(),
+    }
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -50,7 +62,7 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=-1,
         help=(
-            "Maximum CPU threads for feature extraction and matching; "
+            "Maximum CPU threads for feature extraction, matching, and mapping; "
             "-1 lets COLMAP use all available threads (default: -1)."
         ),
     )
@@ -60,7 +72,8 @@ def build_parser() -> argparse.ArgumentParser:
         default=0.5,
         help=(
             "Fail unless the largest sparse model registers at least this "
-            "fraction of input images and at least 10 images (default: 0.5)."
+            "fraction of input images and at least 10 images when available "
+            "(default: 0.5)."
         ),
     )
     return parser
@@ -108,7 +121,10 @@ def _minimum_registered_images(
         raise ValueError(
             "--min-registration-ratio must be greater than 0 and at most 1"
         )
-    return max(10, math.ceil(total_images * min_registration_ratio))
+    return min(
+        total_images,
+        max(10, math.ceil(total_images * min_registration_ratio)),
+    )
 
 
 def _write_reconstruction_stats(dataset: Path, stats: dict[str, object]) -> Path:
@@ -166,10 +182,13 @@ def reconstruct(
         device=pycolmap.Device.cpu,
     )
 
-    print(f"Sequentially matching with overlap={overlap}")
+    print(
+        f"Sequentially matching with overlap={overlap} and sparse "
+        "long-baseline pairs"
+    )
     pairing_options = pycolmap.SequentialPairingOptions(
         overlap=overlap,
-        quadratic_overlap=False,
+        quadratic_overlap=True,
     )
     matching_options = pycolmap.FeatureMatchingOptions(
         num_threads=num_threads,
@@ -182,11 +201,15 @@ def reconstruct(
         device=pycolmap.Device.cpu,
     )
 
-    print("Running incremental structure-from-motion")
+    print(f"Running incremental structure-from-motion with threads={num_threads}")
+    mapping_options = pycolmap.IncrementalPipelineOptions(
+        num_threads=num_threads,
+    )
     reconstructions = pycolmap.incremental_mapping(
         database_path=database_path,
         image_path=image_dir,
         output_path=sparse_path,
+        options=mapping_options,
     )
     if not reconstructions:
         raise RuntimeError(
@@ -205,6 +228,8 @@ def reconstruct(
     passed_quality_gate = registered >= minimum_registered
     stats = {
         "camera_model": camera_model,
+        "matching_overlap": overlap,
+        "matching_quadratic_overlap": True,
         "minimum_registered_images": minimum_registered,
         "minimum_registration_ratio": min_registration_ratio,
         "num_input_images": len(images),
@@ -212,15 +237,16 @@ def reconstruct(
         "num_registered_images": registered,
         "registration_ratio": registration_ratio,
         "selected_model_id": model_id,
+        "selected_model_path": "sparse/0",
         "status": "passed" if passed_quality_gate else "failed",
     }
-    stats_path = _write_reconstruction_stats(dataset, stats)
 
     print(reconstruction.summary())
     print(f"Selected largest model: {registered}/{len(images)} registered images")
     print(f"Sparse points: {points}")
-    print(f"Reconstruction stats: {stats_path}")
     if not passed_quality_gate:
+        stats_path = _write_reconstruction_stats(dataset, stats)
+        print(f"Reconstruction stats: {stats_path}")
         raise RuntimeError(
             "COLMAP registration quality gate failed: "
             f"{registered}/{len(images)} images registered "
@@ -233,7 +259,31 @@ def reconstruct(
     model_path = sparse_path / "0"
     model_path.mkdir(parents=True, exist_ok=True)
     reconstruction.write(model_path)
+    required_model_files = (
+        model_path / "cameras.bin",
+        model_path / "images.bin",
+        model_path / "points3D.bin",
+    )
+    incomplete_files = [
+        str(path)
+        for path in required_model_files
+        if not path.is_file() or path.stat().st_size == 0
+    ]
+    if incomplete_files:
+        raise RuntimeError(
+            "Selected COLMAP model was not written completely: "
+            + ", ".join(incomplete_files)
+        )
+
+    stats["selected_model_files"] = {
+        path.name: _file_identity(path) for path in required_model_files
+    }
+
+    # A passed stats file is the final, atomic completion marker. Never write it
+    # before the selected model is durably present and structurally complete.
+    stats_path = _write_reconstruction_stats(dataset, stats)
     print(f"gsplat COLMAP model: {model_path}")
+    print(f"Reconstruction stats: {stats_path}")
     return model_path
 
 

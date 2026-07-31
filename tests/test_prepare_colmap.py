@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import sys
 import tempfile
@@ -55,7 +56,8 @@ class InputValidationTests(unittest.TestCase):
             with self.assertRaises(FileExistsError):
                 _validate_input(dataset, overlap=15)
 
-    def test_registration_threshold_requires_ratio_and_ten_images(self) -> None:
+    def test_registration_threshold_uses_ten_image_floor_when_available(self) -> None:
+        self.assertEqual(_minimum_registered_images(8, 0.5), 8)
         self.assertEqual(_minimum_registered_images(12, 0.5), 10)
         self.assertEqual(_minimum_registered_images(20, 0.75), 15)
         self.assertEqual(_minimum_registered_images(21, 0.5), 11)
@@ -83,6 +85,9 @@ class FakeReconstruction:
 
     def write(self, path: Path) -> None:
         self.written_to = Path(path)
+        self.written_to.mkdir(parents=True, exist_ok=True)
+        for name in ("cameras.bin", "images.bin", "points3D.bin"):
+            (self.written_to / name).write_bytes(name.encode("ascii"))
 
 
 class OrchestrationTests(unittest.TestCase):
@@ -107,6 +112,10 @@ class OrchestrationTests(unittest.TestCase):
             def __init__(self, **kwargs: object) -> None:
                 self.kwargs = kwargs
 
+        class IncrementalPipelineOptions:
+            def __init__(self, **kwargs: object) -> None:
+                self.kwargs = kwargs
+
         def record(name: str, result: object = None):
             def function(**kwargs: object) -> object:
                 calls.append((name, kwargs))
@@ -122,6 +131,7 @@ class OrchestrationTests(unittest.TestCase):
             SequentialPairingOptions=SequentialPairingOptions,
             FeatureExtractionOptions=FeatureExtractionOptions,
             FeatureMatchingOptions=FeatureMatchingOptions,
+            IncrementalPipelineOptions=IncrementalPipelineOptions,
             extract_features=record("extract_features"),
             match_sequential=record("match_sequential"),
             incremental_mapping=record(
@@ -175,7 +185,7 @@ class OrchestrationTests(unittest.TestCase):
             match_call = calls[1][1]
             self.assertEqual(
                 match_call["pairing_options"].kwargs,
-                {"overlap": 9, "quadratic_overlap": False},
+                {"overlap": 9, "quadratic_overlap": True},
             )
             self.assertEqual(
                 match_call["matching_options"].kwargs,
@@ -187,6 +197,10 @@ class OrchestrationTests(unittest.TestCase):
             self.assertEqual(mapping_call["database_path"], dataset / "database.db")
             self.assertEqual(mapping_call["image_path"], images)
             self.assertEqual(mapping_call["output_path"], dataset / "sparse")
+            self.assertEqual(
+                mapping_call["options"].kwargs,
+                {"num_threads": 6},
+            )
 
             with (dataset / "reconstruction_stats.json").open(
                 encoding="utf-8"
@@ -196,6 +210,8 @@ class OrchestrationTests(unittest.TestCase):
                 stats,
                 {
                     "camera_model": "OPENCV_FISHEYE",
+                    "matching_overlap": 9,
+                    "matching_quadratic_overlap": True,
                     "minimum_registered_images": 10,
                     "minimum_registration_ratio": 0.5,
                     "num_input_images": 12,
@@ -203,6 +219,20 @@ class OrchestrationTests(unittest.TestCase):
                     "num_registered_images": 10,
                     "registration_ratio": 10 / 12,
                     "selected_model_id": 1,
+                    "selected_model_files": {
+                        name: {
+                            "size_bytes": len(name),
+                            "sha256": hashlib.sha256(
+                                name.encode("ascii")
+                            ).hexdigest(),
+                        }
+                        for name in (
+                            "cameras.bin",
+                            "images.bin",
+                            "points3D.bin",
+                        )
+                    },
+                    "selected_model_path": "sparse/0",
                     "status": "passed",
                 },
             )
@@ -230,6 +260,7 @@ class OrchestrationTests(unittest.TestCase):
             SequentialPairingOptions=Options,
             FeatureExtractionOptions=Options,
             FeatureMatchingOptions=Options,
+            IncrementalPipelineOptions=Options,
             extract_features=record("extract_features"),
             match_sequential=record("match_sequential"),
             incremental_mapping=record("incremental_mapping", {7: weak}),
@@ -262,6 +293,69 @@ class OrchestrationTests(unittest.TestCase):
             self.assertEqual(stats["status"], "failed")
             self.assertEqual(stats["num_registered_images"], 9)
             self.assertEqual(stats["minimum_registered_images"], 10)
+
+    def test_does_not_publish_passed_stats_when_model_write_fails(self) -> None:
+        class FailingWriteReconstruction(FakeReconstruction):
+            def write(self, path: Path) -> None:
+                raise OSError("disk full")
+
+        class PartialWriteReconstruction(FakeReconstruction):
+            def write(self, path: Path) -> None:
+                path.mkdir(parents=True, exist_ok=True)
+                (path / "cameras.bin").write_bytes(b"partial")
+
+        class Options:
+            def __init__(self, **kwargs: object) -> None:
+                self.kwargs = kwargs
+
+        cases = (
+            (
+                FailingWriteReconstruction(registered=10, points=50),
+                OSError,
+                "disk full",
+            ),
+            (
+                PartialWriteReconstruction(registered=10, points=50),
+                RuntimeError,
+                "not written completely",
+            ),
+        )
+        for reconstruction, error_type, message in cases:
+            with (
+                self.subTest(error=message),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
+                dataset = Path(temporary).resolve()
+                images = dataset / "images"
+                images.mkdir()
+                for index in range(12):
+                    (images / f"{index:06d}.jpg").write_bytes(b"image")
+
+                fake_pycolmap = types.SimpleNamespace(
+                    __version__="test",
+                    CameraMode=types.SimpleNamespace(SINGLE="single"),
+                    Device=types.SimpleNamespace(cpu="cpu"),
+                    ImageReaderOptions=Options,
+                    SequentialPairingOptions=Options,
+                    FeatureExtractionOptions=Options,
+                    FeatureMatchingOptions=Options,
+                    IncrementalPipelineOptions=Options,
+                    extract_features=lambda **kwargs: None,
+                    match_sequential=lambda **kwargs: None,
+                    incremental_mapping=lambda **kwargs: {0: reconstruction},
+                )
+                with patch.dict(sys.modules, {"pycolmap": fake_pycolmap}):
+                    with self.assertRaisesRegex(error_type, message):
+                        reconstruct(
+                            dataset,
+                            overlap=9,
+                            camera_model="SIMPLE_RADIAL",
+                            num_threads=2,
+                        )
+
+                self.assertFalse(
+                    (dataset / "reconstruction_stats.json").exists()
+                )
 
     def test_rejects_invalid_thread_count_before_importing_pycolmap(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

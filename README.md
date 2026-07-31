@@ -152,8 +152,10 @@ uv run --project third-party/gsplat --no-sync \
   --num-threads 8
 ```
 
-The defaults use one shared `SIMPLE_RADIAL` camera, sequential video-frame
-matching, incremental structure from motion, and the largest recovered model.
+The defaults use one shared `SIMPLE_RADIAL` camera, a dense sequential
+video-frame match window plus sparse longer-baseline pairs, incremental
+structure from motion, and the largest recovered model. `--num-threads` bounds
+feature extraction, matching, and mapping, not just the first two stages.
 The complete dataset then contains:
 
 ```text
@@ -161,6 +163,7 @@ ambulance_input_v1/
 ├── images/
 ├── metadata.json
 ├── database.db
+├── reconstruction_stats.json
 └── sparse/
     └── 0/
         ├── cameras.bin
@@ -168,12 +171,13 @@ ambulance_input_v1/
         └── points3D.bin
 ```
 
-At minimum, require most frames to register into one connected reconstruction
-and a substantial sparse-point count. Use the short pilot's validation renders
-as the visual geometry gate. If registration is weak, create a new dataset at
-5 FPS, remove blurred frames, or recapture with more overlap and texture.
-Increasing `--overlap` helps only when the useful matching window is wider than
-15 frames.
+The command has a default-on hard quality gate: the largest model must register
+at least 50% of the input and at least 10 images when 10 or more are available.
+Set a deliberate threshold with `--min-registration-ratio 0.7`. Use the short
+pilot's validation renders as the visual geometry gate. If registration is
+weak, create a new dataset at 5 FPS, remove blurred frames, or recapture with
+more overlap and texture. Increasing `--overlap` helps only when the useful
+dense matching window is wider than 15 frames.
 
 ## 5. Run a short pilot
 

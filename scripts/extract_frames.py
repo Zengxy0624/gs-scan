@@ -3,14 +3,34 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import shutil
 import sys
 import tempfile
+import uuid
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Sequence
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _tree_sha256(directory: Path) -> str:
+    digest = hashlib.sha256()
+    for path in sorted(item for item in directory.rglob("*") if item.is_file()):
+        digest.update(path.relative_to(directory).as_posix().encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(_sha256(path).encode("ascii"))
+        digest.update(b"\0")
+    return digest.hexdigest()
 
 
 @dataclass(frozen=True)
@@ -184,6 +204,8 @@ def create_dataset(
 
     dataset.parent.mkdir(parents=True, exist_ok=True)
     source_stat = video.stat()
+    print(f"Hashing source capture: {video}", flush=True)
+    source_sha256 = _sha256(video)
     temporary = Path(
         tempfile.mkdtemp(prefix=f".{dataset.name}.", dir=str(dataset.parent))
     )
@@ -195,11 +217,15 @@ def create_dataset(
             max_frames,
             jpeg_quality,
         )
+        images_sha256 = _tree_sha256(temporary / "images")
         metadata = {
             "dataset_type": "single_video",
+            "dataset_instance_id": str(uuid.uuid4()),
             "source_video": str(video),
             "source_size_bytes": source_stat.st_size,
             "source_mtime_ns": source_stat.st_mtime_ns,
+            "source_sha256": source_sha256,
+            "images_sha256": images_sha256,
             "sample_fps": sample_fps,
             "max_frames": max_frames,
             "jpeg_quality": jpeg_quality,
