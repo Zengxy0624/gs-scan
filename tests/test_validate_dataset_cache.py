@@ -7,7 +7,7 @@ import unittest
 import uuid
 from pathlib import Path
 
-from scripts.validate_dataset_cache import validate_cache
+from scripts.validate_dataset_cache import _tree_sha256, build_parser, validate_cache
 
 
 def source_metadata(path: Path) -> dict[str, object]:
@@ -50,7 +50,234 @@ def create_sparse_model(directory: Path) -> dict[str, dict[str, object]]:
     return identities
 
 
+def create_video_set_cache(
+    root: Path,
+    sources: list[Path],
+) -> Path:
+    dataset = root / "dataset"
+    images = dataset / "images"
+    images.mkdir(parents=True)
+    prefixes = ("00_inward_orbit_", "01_upward_")
+    counts = (2, 3)
+    records = []
+    for source, prefix, count in zip(sources, prefixes, counts, strict=True):
+        identity = source_metadata(source)
+        for index in range(count):
+            (images / f"{prefix}{index:06d}.jpg").write_bytes(b"jpeg")
+        records.append(
+            {
+                "source_video": identity["path"],
+                "source_size_bytes": identity["size_bytes"],
+                "source_mtime_ns": identity["mtime_ns"],
+                "source_sha256": identity["sha256"],
+                "image_prefix": prefix,
+                "selected_indices": list(range(count)),
+                "output_frame_width": 64,
+                "output_frame_height": 48,
+            }
+        )
+    (dataset / "metadata.json").write_text(
+        json.dumps(
+            {
+                "dataset_type": "video_set",
+                "dataset_instance_id": str(uuid.uuid4()),
+                "sources": records,
+                "total_selected_frames": sum(counts),
+                "output_frame_width": 64,
+                "output_frame_height": 48,
+                "images_sha256": _tree_sha256(images),
+                "sample_fps": 6.0,
+                "max_frames": 100000,
+            }
+        ),
+        encoding="utf-8",
+    )
+    model_files = create_sparse_model(dataset / "sparse" / "0")
+    (dataset / "reconstruction_stats.json").write_text(
+        json.dumps(
+            {
+                "status": "passed",
+                "camera_model": "OPENCV",
+                "matching_overlap": 15,
+                "matching_quadratic_overlap": True,
+                "minimum_registration_ratio": 0.5,
+                "num_input_images": sum(counts),
+                "selected_model_files": model_files,
+                "selected_model_path": "sparse/0",
+            }
+        ),
+        encoding="utf-8",
+    )
+    return dataset
+
+
 class DatasetCacheValidationTests(unittest.TestCase):
+    def test_accepts_ordered_video_set_and_cli_sources(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            inward = root / "inward_orbit.mov"
+            upward = root / "upward.mov"
+            inward.write_bytes(b"inward")
+            upward.write_bytes(b"upward-longer")
+            dataset = create_video_set_cache(root, [inward, upward])
+
+            validate_cache(
+                dataset,
+                [inward, upward],
+                6.0,
+                100000,
+                camera_model="OPENCV",
+                overlap=15,
+                quadratic_overlap=True,
+                require_colmap=True,
+            )
+            args = build_parser().parse_args(
+                [
+                    str(dataset),
+                    str(inward),
+                    str(upward),
+                    "--sample-fps",
+                    "6",
+                    "--max-frames",
+                    "100000",
+                ]
+            )
+            self.assertEqual(args.source, [inward, upward])
+
+    def test_video_set_rejects_source_order_and_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            inward = root / "inward_orbit.mov"
+            upward = root / "upward.mov"
+            inward.write_bytes(b"inward")
+            upward.write_bytes(b"upward-longer")
+            dataset = create_video_set_cache(root, [inward, upward])
+
+            with self.assertRaisesRegex(ValueError, "source capture 1 changed"):
+                validate_cache(
+                    dataset,
+                    [upward, inward],
+                    6.0,
+                    100000,
+                )
+
+            upward.write_bytes(b"changed-upward-video")
+            with self.assertRaisesRegex(ValueError, "source capture 2 changed"):
+                validate_cache(
+                    dataset,
+                    [inward, upward],
+                    6.0,
+                    100000,
+                )
+
+    def test_video_set_rejects_frame_set_and_colmap_input_count(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            inward = root / "inward_orbit.mov"
+            upward = root / "upward.mov"
+            inward.write_bytes(b"inward")
+            upward.write_bytes(b"upward")
+            dataset = create_video_set_cache(root, [inward, upward])
+
+            missing = dataset / "images" / "01_upward_000002.jpg"
+            content = missing.read_bytes()
+            missing.unlink()
+            with self.assertRaisesRegex(ValueError, "frame set"):
+                validate_cache(dataset, [inward, upward], 6.0, 100000)
+
+            missing.write_bytes(content)
+            stats_path = dataset / "reconstruction_stats.json"
+            stats = json.loads(stats_path.read_text(encoding="utf-8"))
+            stats["num_input_images"] = 2
+            stats_path.write_text(json.dumps(stats), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "input-image count"):
+                validate_cache(dataset, [inward, upward], 6.0, 100000)
+
+    def test_validates_matching_strategy_and_per_source_gate(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            inward = root / "inward_orbit.mov"
+            upward = root / "upward.mov"
+            inward.write_bytes(b"inward")
+            upward.write_bytes(b"upward")
+            dataset = create_video_set_cache(root, [inward, upward])
+            stats_path = dataset / "reconstruction_stats.json"
+            stats = json.loads(stats_path.read_text(encoding="utf-8"))
+            stats.update(
+                {
+                    "matching_strategy": "exhaustive",
+                    "matching_quadratic_overlap": False,
+                    "minimum_source_registration_ratio": 0.8,
+                    "source_registration": [
+                        {
+                            "source_index": 0,
+                            "image_prefix": "00_inward_orbit_",
+                            "num_input_images": 2,
+                            "num_registered_images": 2,
+                            "registration_ratio": 1.0,
+                            "minimum_registration_ratio": 0.8,
+                            "status": "passed",
+                        },
+                        {
+                            "source_index": 1,
+                            "image_prefix": "01_upward_",
+                            "num_input_images": 3,
+                            "num_registered_images": 3,
+                            "registration_ratio": 1.0,
+                            "minimum_registration_ratio": 0.8,
+                            "status": "passed",
+                        },
+                    ],
+                }
+            )
+            stats_path.write_text(json.dumps(stats), encoding="utf-8")
+
+            validate_cache(
+                dataset,
+                [inward, upward],
+                6.0,
+                100000,
+                require_colmap=True,
+                matching_strategy="exhaustive",
+                min_source_registration_ratio=0.8,
+            )
+            args = build_parser().parse_args(
+                [
+                    str(dataset),
+                    str(inward),
+                    str(upward),
+                    "--sample-fps",
+                    "6",
+                    "--max-frames",
+                    "100000",
+                    "--matching-strategy",
+                    "exhaustive",
+                    "--min-source-registration-ratio",
+                    "0.8",
+                ]
+            )
+            self.assertEqual(args.matching_strategy, "exhaustive")
+            self.assertEqual(args.min_source_registration_ratio, 0.8)
+
+            with self.assertRaisesRegex(ValueError, "matching_strategy"):
+                validate_cache(
+                    dataset,
+                    [inward, upward],
+                    6.0,
+                    100000,
+                    matching_strategy="sequential",
+                )
+            stats["source_registration"][1]["status"] = "failed"
+            stats_path.write_text(json.dumps(stats), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "per-source diagnostics"):
+                validate_cache(
+                    dataset,
+                    [inward, upward],
+                    6.0,
+                    100000,
+                    min_source_registration_ratio=0.8,
+                )
+
     def test_accepts_matching_single_video(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

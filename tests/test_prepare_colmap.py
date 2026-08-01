@@ -21,6 +21,8 @@ class InputValidationTests(unittest.TestCase):
     def test_defaults_to_opencv_camera_model(self) -> None:
         args = build_parser().parse_args(["dataset"])
         self.assertEqual(args.camera_model, "OPENCV")
+        self.assertEqual(args.matching, "sequential")
+        self.assertIsNone(args.min_source_registration_ratio)
 
     def test_requires_images(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -74,13 +76,29 @@ class InputValidationTests(unittest.TestCase):
 
 
 class FakeReconstruction:
-    def __init__(self, registered: int, points: int) -> None:
+    def __init__(
+        self,
+        registered: int,
+        points: int,
+        registered_names: list[str] | None = None,
+        unregistered_names: list[str] | None = None,
+    ) -> None:
         self.registered = registered
         self.points = points
         self.written_to: Path | None = None
+        registered_names = registered_names or []
+        all_names = [*registered_names, *(unregistered_names or [])]
+        self.images = {
+            index: types.SimpleNamespace(name=name)
+            for index, name in enumerate(all_names)
+        }
+        self._registered_image_ids = list(range(len(registered_names)))
 
     def num_reg_images(self) -> int:
         return self.registered
+
+    def reg_image_ids(self) -> list[int]:
+        return self._registered_image_ids
 
     def num_points3D(self) -> int:
         return self.points
@@ -215,6 +233,7 @@ class OrchestrationTests(unittest.TestCase):
                 stats,
                 {
                     "camera_model": "OPENCV_FISHEYE",
+                    "matching_strategy": "sequential",
                     "matching_overlap": 9,
                     "matching_quadratic_overlap": True,
                     "minimum_registered_images": 10,
@@ -241,6 +260,204 @@ class OrchestrationTests(unittest.TestCase):
                     "status": "passed",
                 },
             )
+
+    def test_exhaustive_matching_uses_cpu_and_skips_sequential_pairing(
+        self,
+    ) -> None:
+        calls: list[tuple[str, dict[str, object]]] = []
+        reconstruction = FakeReconstruction(registered=10, points=50)
+
+        class Options:
+            def __init__(self, **kwargs: object) -> None:
+                self.kwargs = kwargs
+
+        def record(name: str, result: object = None):
+            def function(**kwargs: object) -> object:
+                calls.append((name, kwargs))
+                return result
+
+            return function
+
+        fake_pycolmap = types.SimpleNamespace(
+            __version__="test",
+            CameraMode=types.SimpleNamespace(SINGLE="single"),
+            Device=types.SimpleNamespace(cpu="cpu"),
+            ImageReaderOptions=Options,
+            SequentialPairingOptions=Options,
+            FeatureExtractionOptions=Options,
+            FeatureMatchingOptions=Options,
+            IncrementalPipelineOptions=Options,
+            extract_features=record("extract_features"),
+            match_sequential=record("match_sequential"),
+            match_exhaustive=record("match_exhaustive"),
+            incremental_mapping=record(
+                "incremental_mapping",
+                {0: reconstruction},
+            ),
+        )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            dataset = Path(temporary).resolve()
+            images = dataset / "images"
+            images.mkdir()
+            for index in range(12):
+                (images / f"{index:06d}.jpg").write_bytes(b"image")
+
+            with patch.dict(sys.modules, {"pycolmap": fake_pycolmap}):
+                reconstruct(
+                    dataset,
+                    overlap=9,
+                    camera_model="OPENCV",
+                    num_threads=4,
+                    matching_strategy="exhaustive",
+                )
+
+            self.assertEqual(
+                [name for name, _ in calls],
+                ["extract_features", "match_exhaustive", "incremental_mapping"],
+            )
+            match_call = calls[1][1]
+            self.assertEqual(
+                match_call["matching_options"].kwargs,
+                {"num_threads": 4, "use_gpu": False},
+            )
+            self.assertEqual(match_call["device"], "cpu")
+            stats = json.loads(
+                (dataset / "reconstruction_stats.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(stats["matching_strategy"], "exhaustive")
+            self.assertFalse(stats["matching_quadratic_overlap"])
+
+    def test_video_set_source_registration_gate_records_pass_and_fail(
+        self,
+    ) -> None:
+        class Options:
+            def __init__(self, **kwargs: object) -> None:
+                self.kwargs = kwargs
+
+        for upward_registered, expected_status in ((8, "passed"), (7, "failed")):
+            with (
+                self.subTest(
+                    upward_registered=upward_registered,
+                    expected_status=expected_status,
+                ),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
+                dataset = Path(temporary).resolve()
+                images = dataset / "images"
+                images.mkdir()
+                prefixes = ("00_inward_orbit_", "01_upward_")
+                for prefix in prefixes:
+                    for index in range(10):
+                        (images / f"{prefix}{index:06d}.jpg").write_bytes(b"image")
+                (dataset / "metadata.json").write_text(
+                    json.dumps(
+                        {
+                            "dataset_type": "video_set",
+                            "sources": [
+                                {
+                                    "image_prefix": prefix,
+                                    "selected_indices": list(range(10)),
+                                }
+                                for prefix in prefixes
+                            ],
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                registered_names = [
+                    f"{prefixes[0]}{index:06d}.jpg" for index in range(8)
+                ]
+                registered_names.extend(
+                    f"{prefixes[1]}{index:06d}.jpg"
+                    for index in range(upward_registered)
+                )
+                unregistered_names = [
+                    f"{prefixes[0]}{index:06d}.jpg" for index in range(8, 10)
+                ]
+                unregistered_names.extend(
+                    f"{prefixes[1]}{index:06d}.jpg"
+                    for index in range(upward_registered, 10)
+                )
+                reconstruction = FakeReconstruction(
+                    registered=len(registered_names),
+                    points=50,
+                    registered_names=registered_names,
+                    unregistered_names=unregistered_names,
+                )
+                fake_pycolmap = types.SimpleNamespace(
+                    __version__="test",
+                    CameraMode=types.SimpleNamespace(SINGLE="single"),
+                    Device=types.SimpleNamespace(cpu="cpu"),
+                    ImageReaderOptions=Options,
+                    SequentialPairingOptions=Options,
+                    FeatureExtractionOptions=Options,
+                    FeatureMatchingOptions=Options,
+                    IncrementalPipelineOptions=Options,
+                    extract_features=lambda **kwargs: None,
+                    match_sequential=lambda **kwargs: None,
+                    match_exhaustive=lambda **kwargs: None,
+                    incremental_mapping=lambda **kwargs: {0: reconstruction},
+                )
+
+                with patch.dict(sys.modules, {"pycolmap": fake_pycolmap}):
+                    if expected_status == "passed":
+                        reconstruct(
+                            dataset,
+                            overlap=9,
+                            camera_model="OPENCV",
+                            matching_strategy="exhaustive",
+                            min_source_registration_ratio=0.8,
+                        )
+                    else:
+                        with self.assertRaisesRegex(
+                            RuntimeError,
+                            r"per-source.*01_upward_: 7/10.*need at least 80.0%",
+                        ):
+                            reconstruct(
+                                dataset,
+                                overlap=9,
+                                camera_model="OPENCV",
+                                matching_strategy="exhaustive",
+                                min_source_registration_ratio=0.8,
+                            )
+
+                stats = json.loads(
+                    (dataset / "reconstruction_stats.json").read_text(
+                        encoding="utf-8"
+                    )
+                )
+                self.assertEqual(stats["status"], expected_status)
+                self.assertEqual(stats["minimum_source_registration_ratio"], 0.8)
+                self.assertEqual(
+                    stats["source_registration"],
+                    [
+                        {
+                            "source_index": 0,
+                            "image_prefix": "00_inward_orbit_",
+                            "num_input_images": 10,
+                            "num_registered_images": 8,
+                            "registration_ratio": 0.8,
+                            "minimum_registration_ratio": 0.8,
+                            "status": "passed",
+                        },
+                        {
+                            "source_index": 1,
+                            "image_prefix": "01_upward_",
+                            "num_input_images": 10,
+                            "num_registered_images": upward_registered,
+                            "registration_ratio": upward_registered / 10,
+                            "minimum_registration_ratio": 0.8,
+                            "status": expected_status,
+                        },
+                    ],
+                )
+                if expected_status == "passed":
+                    self.assertIsNotNone(reconstruction.written_to)
+                else:
+                    self.assertIsNone(reconstruction.written_to)
 
     def test_fails_quality_gate_and_records_diagnostics(self) -> None:
         calls: list[tuple[str, dict[str, object]]] = []

@@ -8,8 +8,16 @@ import tempfile
 import unittest
 import uuid
 from pathlib import Path
+from unittest import mock
 
-from scripts.extract_frames import _tree_sha256, create_dataset, select_frame_indices
+from scripts.extract_frames import (
+    VideoSample,
+    _tree_sha256,
+    build_parser,
+    create_dataset,
+    create_video_set_dataset,
+    select_frame_indices,
+)
 
 
 class FrameSelectionTests(unittest.TestCase):
@@ -51,6 +59,35 @@ class FrameSelectionTests(unittest.TestCase):
 
 
 class DatasetCreationTests(unittest.TestCase):
+    @staticmethod
+    def fake_sample(
+        video: Path,
+        images_dir: Path,
+        sample_fps: float,
+        max_frames: int,
+        jpeg_quality: int,
+        *,
+        dimensions: tuple[int, int] = (64, 48),
+    ) -> VideoSample:
+        del sample_fps, max_frames, jpeg_quality
+        count = 2 if video.stem == "inward_orbit" else 3
+        images_dir.mkdir(parents=True)
+        for index in range(count):
+            (images_dir / f"{index:06d}.jpg").write_bytes(
+                f"{video.stem}-{index}".encode("utf-8")
+            )
+        return VideoSample(
+            source_fps=30.0,
+            total_source_frames=30,
+            duration_seconds=29 / 30,
+            selected_indices=list(range(count)),
+            selected_timestamps_seconds=[index / 30 for index in range(count)],
+            source_frame_width=dimensions[0],
+            source_frame_height=dimensions[1],
+            output_frame_width=dimensions[0],
+            output_frame_height=dimensions[1],
+        )
+
     def test_rejects_existing_dataset_without_changing_it(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -97,6 +134,129 @@ class DatasetCreationTests(unittest.TestCase):
                         quality,
                     )
                 self.assertFalse(dataset.exists())
+
+    def test_creates_ordered_video_set_with_flat_prefixed_images(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            inward = root / "inward_orbit.mov"
+            upward = root / "upward.mov"
+            inward.write_bytes(b"inward-video")
+            upward.write_bytes(b"upward-video")
+            dataset = root / "dataset"
+
+            with mock.patch(
+                "scripts.extract_frames.extract_frames",
+                side_effect=self.fake_sample,
+            ):
+                create_video_set_dataset(
+                    [inward, upward],
+                    dataset,
+                    6.0,
+                    100000,
+                    95,
+                )
+
+            images = sorted(path.name for path in (dataset / "images").iterdir())
+            self.assertEqual(
+                images,
+                [
+                    "00_inward_orbit_000000.jpg",
+                    "00_inward_orbit_000001.jpg",
+                    "01_upward_000000.jpg",
+                    "01_upward_000001.jpg",
+                    "01_upward_000002.jpg",
+                ],
+            )
+            metadata = json.loads(
+                (dataset / "metadata.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(metadata["dataset_type"], "video_set")
+            self.assertEqual(metadata["sample_fps"], 6.0)
+            self.assertEqual(metadata["max_frames"], 100000)
+            self.assertEqual(metadata["total_selected_frames"], 5)
+            self.assertEqual(
+                (metadata["output_frame_width"], metadata["output_frame_height"]),
+                (64, 48),
+            )
+            self.assertEqual(
+                [record["source_video"] for record in metadata["sources"]],
+                [str(inward.resolve()), str(upward.resolve())],
+            )
+            self.assertEqual(
+                [record["image_prefix"] for record in metadata["sources"]],
+                ["00_inward_orbit_", "01_upward_"],
+            )
+            self.assertEqual(
+                [record["selected_indices"] for record in metadata["sources"]],
+                [[0, 1], [0, 1, 2]],
+            )
+            self.assertEqual(
+                [record["source_sha256"] for record in metadata["sources"]],
+                [
+                    hashlib.sha256(inward.read_bytes()).hexdigest(),
+                    hashlib.sha256(upward.read_bytes()).hexdigest(),
+                ],
+            )
+            self.assertEqual(
+                metadata["images_sha256"],
+                _tree_sha256(dataset / "images"),
+            )
+            uuid.UUID(metadata["dataset_instance_id"])
+
+    def test_video_set_dimension_mismatch_is_atomic(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            inward = root / "inward_orbit.mov"
+            upward = root / "upward.mov"
+            inward.write_bytes(b"inward")
+            upward.write_bytes(b"upward")
+            dataset = root / "dataset"
+
+            def mismatched_sample(*args: object, **kwargs: object) -> VideoSample:
+                video = args[0]
+                assert isinstance(video, Path)
+                dimensions = (
+                    (64, 48)
+                    if video.name == "inward_orbit.mov"
+                    else (48, 64)
+                )
+                return self.fake_sample(*args, **kwargs, dimensions=dimensions)
+
+            with (
+                mock.patch(
+                    "scripts.extract_frames.extract_frames",
+                    side_effect=mismatched_sample,
+                ),
+                self.assertRaisesRegex(ValueError, "same output dimensions"),
+            ):
+                create_video_set_dataset(
+                    [inward, upward],
+                    dataset,
+                    6.0,
+                    100000,
+                    95,
+                )
+
+            self.assertFalse(dataset.exists())
+            self.assertEqual(list(root.glob(".dataset.*")), [])
+
+    def test_cli_preserves_primary_video_and_additional_source_order(self) -> None:
+        args = build_parser().parse_args(
+            [
+                "inward_orbit.mov",
+                "dataset",
+                "--additional-video",
+                "upward.mov",
+                "--additional-video",
+                "ceiling.mov",
+            ]
+        )
+
+        self.assertEqual(args.video, Path("inward_orbit.mov"))
+        self.assertEqual(
+            args.additional_video,
+            [Path("upward.mov"), Path("ceiling.mov")],
+        )
 
     @unittest.skipUnless(
         importlib.util.find_spec("cv2") is not None,

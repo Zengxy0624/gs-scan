@@ -49,6 +49,16 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--matching",
+        choices=("sequential", "exhaustive"),
+        default="sequential",
+        help=(
+            "Feature-pairing strategy. Sequential uses the quadratic-neighbor "
+            "overlap; exhaustive compares every image pair (default: "
+            "sequential)."
+        ),
+    )
+    parser.add_argument(
         "--camera-model",
         default=DEFAULT_CAMERA_MODEL,
         choices=(
@@ -81,6 +91,15 @@ def build_parser() -> argparse.ArgumentParser:
             "Fail unless the largest sparse model registers at least this "
             "fraction of input images and at least 10 images when available "
             "(default: 0.5)."
+        ),
+    )
+    parser.add_argument(
+        "--min-source-registration-ratio",
+        type=float,
+        default=None,
+        help=(
+            "For a video_set dataset, additionally require this registration "
+            "ratio independently for every source video. Disabled by default."
         ),
     )
     return parser
@@ -134,6 +153,97 @@ def _minimum_registered_images(
     )
 
 
+def _video_set_sources(
+    dataset: Path,
+    min_source_registration_ratio: float | None,
+) -> list[dict[str, object]]:
+    """Load the source prefixes needed by the optional video-set gate."""
+    if min_source_registration_ratio is None:
+        return []
+    if not 0.0 < min_source_registration_ratio <= 1.0:
+        raise ValueError(
+            "--min-source-registration-ratio must be greater than 0 and at "
+            "most 1"
+        )
+
+    metadata_path = dataset / "metadata.json"
+    if not metadata_path.is_file():
+        raise FileNotFoundError(
+            "--min-source-registration-ratio requires video_set metadata: "
+            f"{metadata_path}"
+        )
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    if not isinstance(metadata, dict) or metadata.get("dataset_type") != "video_set":
+        raise ValueError(
+            "--min-source-registration-ratio requires dataset_type=video_set"
+        )
+    raw_sources = metadata.get("sources")
+    if not isinstance(raw_sources, list) or not raw_sources:
+        raise ValueError("video_set metadata must contain a non-empty sources list")
+
+    sources: list[dict[str, object]] = []
+    prefixes: list[str] = []
+    for index, raw_source in enumerate(raw_sources):
+        if not isinstance(raw_source, dict):
+            raise ValueError(f"video_set source {index} must be an object")
+        prefix = raw_source.get("image_prefix")
+        selected_indices = raw_source.get("selected_indices")
+        if not isinstance(prefix, str) or not prefix:
+            raise ValueError(
+                f"video_set source {index} must have a non-empty image_prefix"
+            )
+        if not isinstance(selected_indices, list) or not selected_indices:
+            raise ValueError(
+                f"video_set source {index} must have non-empty selected_indices"
+            )
+        if any(
+            prefix.startswith(other) or other.startswith(prefix)
+            for other in prefixes
+        ):
+            raise ValueError("video_set image_prefix values must not overlap")
+        prefixes.append(prefix)
+        sources.append(
+            {
+                "source_index": index,
+                "image_prefix": prefix,
+                "num_input_images": len(selected_indices),
+            }
+        )
+    return sources
+
+
+def _source_registration_diagnostics(
+    reconstruction: object,
+    sources: list[dict[str, object]],
+    minimum_ratio: float,
+) -> list[dict[str, object]]:
+    images = getattr(reconstruction, "images")
+    registered_image_ids = getattr(reconstruction, "reg_image_ids")()
+    registered_names = [
+        str(images[image_id].name) for image_id in registered_image_ids
+    ]
+    diagnostics: list[dict[str, object]] = []
+    for source in sources:
+        prefix = str(source["image_prefix"])
+        input_count = int(source["num_input_images"])
+        registered_count = sum(
+            name.startswith(prefix) for name in registered_names
+        )
+        registration_ratio = registered_count / input_count
+        diagnostics.append(
+            {
+                **source,
+                "num_registered_images": registered_count,
+                "registration_ratio": registration_ratio,
+                "minimum_registration_ratio": minimum_ratio,
+                "status": (
+                    "passed" if registration_ratio >= minimum_ratio else "failed"
+                ),
+            }
+        )
+    return diagnostics
+
+
 def _write_reconstruction_stats(dataset: Path, stats: dict[str, object]) -> Path:
     stats_path = dataset / "reconstruction_stats.json"
     temporary_path = dataset / f".{stats_path.name}.tmp"
@@ -155,17 +265,26 @@ def reconstruct(
     camera_model: str,
     num_threads: int = -1,
     min_registration_ratio: float = 0.5,
+    matching_strategy: str = "sequential",
+    min_source_registration_ratio: float | None = None,
 ) -> Path:
     if num_threads == 0 or num_threads < -1:
         raise ValueError("--num-threads must be -1 or a positive integer")
+    if matching_strategy not in {"sequential", "exhaustive"}:
+        raise ValueError("--matching must be 'sequential' or 'exhaustive'")
     _minimum_registered_images(
         total_images=0,
         min_registration_ratio=min_registration_ratio,
     )
 
+    dataset = dataset.expanduser().resolve()
+    video_set_sources = _video_set_sources(
+        dataset,
+        min_source_registration_ratio,
+    )
+
     import pycolmap
 
-    dataset = dataset.expanduser().resolve()
     image_dir, images = _validate_input(dataset, overlap)
     minimum_registered = _minimum_registered_images(
         total_images=len(images),
@@ -189,24 +308,32 @@ def reconstruct(
         device=pycolmap.Device.cpu,
     )
 
-    print(
-        f"Sequentially matching {overlap} quadratic-neighbor levels "
-        "at frame offsets 1, 2, 4, ..."
-    )
-    pairing_options = pycolmap.SequentialPairingOptions(
-        overlap=overlap,
-        quadratic_overlap=True,
-    )
     matching_options = pycolmap.FeatureMatchingOptions(
         num_threads=num_threads,
         use_gpu=False,
     )
-    pycolmap.match_sequential(
-        database_path=database_path,
-        pairing_options=pairing_options,
-        matching_options=matching_options,
-        device=pycolmap.Device.cpu,
-    )
+    if matching_strategy == "sequential":
+        print(
+            f"Sequentially matching {overlap} quadratic-neighbor levels "
+            "at frame offsets 1, 2, 4, ..."
+        )
+        pairing_options = pycolmap.SequentialPairingOptions(
+            overlap=overlap,
+            quadratic_overlap=True,
+        )
+        pycolmap.match_sequential(
+            database_path=database_path,
+            pairing_options=pairing_options,
+            matching_options=matching_options,
+            device=pycolmap.Device.cpu,
+        )
+    else:
+        print("Exhaustively matching every image pair")
+        pycolmap.match_exhaustive(
+            database_path=database_path,
+            matching_options=matching_options,
+            device=pycolmap.Device.cpu,
+        )
 
     print(f"Running incremental structure-from-motion with threads={num_threads}")
     mapping_options = pycolmap.IncrementalPipelineOptions(
@@ -232,11 +359,25 @@ def reconstruct(
     registered = reconstruction.num_reg_images()
     points = reconstruction.num_points3D()
     registration_ratio = registered / len(images)
-    passed_quality_gate = registered >= minimum_registered
+    passed_global_quality_gate = registered >= minimum_registered
+    source_registration: list[dict[str, object]] = []
+    if min_source_registration_ratio is not None:
+        source_registration = _source_registration_diagnostics(
+            reconstruction,
+            video_set_sources,
+            min_source_registration_ratio,
+        )
+    passed_source_quality_gate = all(
+        source["status"] == "passed" for source in source_registration
+    )
+    passed_quality_gate = (
+        passed_global_quality_gate and passed_source_quality_gate
+    )
     stats = {
         "camera_model": camera_model,
+        "matching_strategy": matching_strategy,
         "matching_overlap": overlap,
-        "matching_quadratic_overlap": True,
+        "matching_quadratic_overlap": matching_strategy == "sequential",
         "minimum_registered_images": minimum_registered,
         "minimum_registration_ratio": min_registration_ratio,
         "num_input_images": len(images),
@@ -247,11 +388,16 @@ def reconstruct(
         "selected_model_path": "sparse/0",
         "status": "passed" if passed_quality_gate else "failed",
     }
+    if min_source_registration_ratio is not None:
+        stats["minimum_source_registration_ratio"] = (
+            min_source_registration_ratio
+        )
+        stats["source_registration"] = source_registration
 
     print(reconstruction.summary())
     print(f"Selected largest model: {registered}/{len(images)} registered images")
     print(f"Sparse points: {points}")
-    if not passed_quality_gate:
+    if not passed_global_quality_gate:
         stats_path = _write_reconstruction_stats(dataset, stats)
         print(f"Reconstruction stats: {stats_path}")
         raise RuntimeError(
@@ -261,6 +407,22 @@ def reconstruct(
             f"images ({min_registration_ratio:.1%} requested). "
             "Inspect capture overlap, blur, and camera settings, then rerun in "
             "a fresh output directory."
+        )
+    if not passed_source_quality_gate:
+        stats_path = _write_reconstruction_stats(dataset, stats)
+        print(f"Reconstruction stats: {stats_path}")
+        failed_sources = ", ".join(
+            f"{source['image_prefix']}: "
+            f"{source['num_registered_images']}/{source['num_input_images']} "
+            f"({source['registration_ratio']:.1%})"
+            for source in source_registration
+            if source["status"] == "failed"
+        )
+        raise RuntimeError(
+            "COLMAP per-source registration quality gate failed: "
+            f"{failed_sources}; need at least "
+            f"{min_source_registration_ratio:.1%} from every source. "
+            "Inspect cross-video overlap and rerun in a fresh output directory."
         )
 
     model_path = sparse_path / "0"
@@ -303,6 +465,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             args.camera_model,
             args.num_threads,
             args.min_registration_ratio,
+            args.matching,
+            args.min_source_registration_ratio,
         )
     except (ImportError, OSError, RuntimeError, ValueError) as error:
         print(f"error: {error}", file=sys.stderr)

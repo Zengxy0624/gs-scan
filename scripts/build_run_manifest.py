@@ -74,6 +74,84 @@ def _source_identity(path: Path, metadata: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _source_paths(source: Path | Sequence[Path]) -> list[Path]:
+    if isinstance(source, Path):
+        return [source]
+    if isinstance(source, (str, bytes)) or not isinstance(source, Sequence):
+        raise TypeError("source must be a Path or an ordered sequence of Paths")
+    paths = list(source)
+    if not paths:
+        raise ValueError("source sequence must not be empty")
+    if any(not isinstance(path, Path) for path in paths):
+        raise TypeError("every source must be a Path")
+    return paths
+
+
+def _video_set_source_identities(
+    paths: Sequence[Path],
+    metadata: dict[str, Any],
+) -> list[dict[str, Any]]:
+    recorded_sources = metadata.get("sources")
+    if not isinstance(recorded_sources, list):
+        raise ValueError("video-set metadata has no ordered source list")
+    if len(recorded_sources) != len(paths):
+        raise ValueError(
+            "Source count does not match video-set frame metadata: "
+            f"expected {len(recorded_sources)}, found {len(paths)}"
+        )
+
+    snapshots: list[dict[str, Any]] = []
+    for index, (path, recorded) in enumerate(zip(paths, recorded_sources)):
+        if not isinstance(recorded, dict):
+            raise ValueError(
+                f"Video-set source metadata entry {index} is not an object"
+            )
+        required_fields = (
+            "source_video",
+            "source_size_bytes",
+            "source_mtime_ns",
+            "source_sha256",
+            "image_prefix",
+            "selected_indices",
+        )
+        missing = [field for field in required_fields if field not in recorded]
+        if missing:
+            raise ValueError(
+                f"Video-set source metadata entry {index} is missing: "
+                + ", ".join(missing)
+            )
+        recorded_digest = recorded["source_sha256"]
+        if not isinstance(recorded_digest, str) or not re.fullmatch(
+            r"[0-9a-f]{64}", recorded_digest
+        ):
+            raise ValueError(
+                f"Video-set source metadata entry {index} has no valid SHA-256"
+            )
+        image_prefix = recorded["image_prefix"]
+        selected_indices = recorded["selected_indices"]
+        if not isinstance(image_prefix, str) or not image_prefix:
+            raise ValueError(
+                f"Video-set source metadata entry {index} has no image prefix"
+            )
+        if not isinstance(selected_indices, list) or any(
+            not isinstance(frame_index, int) or isinstance(frame_index, bool)
+            or frame_index < 0
+            for frame_index in selected_indices
+        ):
+            raise ValueError(
+                f"Video-set source metadata entry {index} has invalid "
+                "selected frame indices"
+            )
+
+        # Comparing each source against the metadata entry at the same index
+        # makes source ordering part of the validated dataset provenance.
+        snapshot = _source_identity(path, recorded)
+        snapshot["image_prefix"] = image_prefix
+        snapshot["selected_indices"] = list(selected_indices)
+        snapshots.append(snapshot)
+    return snapshots
+
+
 def _artifact_identity(path: Path, base: Path) -> dict[str, Any]:
     resolved = path.expanduser().resolve()
     if not resolved.is_file():
@@ -148,7 +226,7 @@ def _clean_git_revision(repository: Path) -> str:
 def build_manifest(
     scene: str,
     dataset: Path,
-    source: Path,
+    source: Path | Sequence[Path],
     sample_fps: float,
     max_frames: int,
     overlap: int,
@@ -158,6 +236,8 @@ def build_manifest(
     gsplat_revision: str,
     colmap_threads: int = -1,
     gpu_id: str = "unspecified",
+    matching_strategy: str = "sequential",
+    min_source_registration_ratio: float | None = None,
 ) -> dict[str, Any]:
     dataset = dataset.expanduser().resolve()
     if not dataset.is_dir():
@@ -168,10 +248,18 @@ def build_manifest(
         raise ValueError("sample_fps must be positive and finite")
     if max_frames < 2:
         raise ValueError("max_frames must be at least 2")
-    if overlap < 1:
+    if matching_strategy not in {"sequential", "exhaustive"}:
+        raise ValueError(
+            "matching_strategy must be 'sequential' or 'exhaustive'"
+        )
+    if matching_strategy == "sequential" and overlap < 1:
         raise ValueError("overlap must be positive")
     if not 0 < min_registration_ratio <= 1:
         raise ValueError("min_registration_ratio must be in (0, 1]")
+    if min_source_registration_ratio is not None and not (
+        0 < min_source_registration_ratio <= 1
+    ):
+        raise ValueError("min_source_registration_ratio must be in (0, 1]")
     if max_steps < 1:
         raise ValueError("max_steps must be positive")
     if camera_model not in CAMERA_MODELS:
@@ -192,7 +280,20 @@ def build_manifest(
         uuid.UUID(dataset_instance_id)
     except ValueError:
         raise ValueError("Dataset has no valid instance identifier") from None
-    source_snapshot = _source_identity(source, metadata)
+    paths = _source_paths(source)
+    is_video_set = metadata.get("dataset_type") == "video_set"
+    if is_video_set:
+        source_snapshots = _video_set_source_identities(paths, metadata)
+        source_identity: str | list[str] = [
+            snapshot["sha256"] for snapshot in source_snapshots
+        ]
+    else:
+        if len(paths) != 1:
+            raise ValueError(
+                "Single-video frame metadata requires exactly one source"
+            )
+        source_snapshot = _source_identity(paths[0], metadata)
+        source_identity = source_snapshot["sha256"]
     if not math.isclose(
         float(metadata.get("sample_fps", -1)),
         sample_fps,
@@ -202,20 +303,42 @@ def build_manifest(
         raise ValueError("Dataset sample_fps does not match manifest request")
     if metadata.get("max_frames") != max_frames:
         raise ValueError("Dataset max_frames does not match manifest request")
+    recorded_matching_strategy = stats.get("matching_strategy", "sequential")
+    if recorded_matching_strategy != matching_strategy:
+        raise ValueError(
+            "COLMAP matching_strategy does not match manifest request: "
+            f"expected {matching_strategy!r}, "
+            f"found {recorded_matching_strategy!r}"
+        )
     expected_reconstruction = {
         "status": "passed",
         "camera_model": camera_model,
-        "matching_overlap": overlap,
-        "matching_quadratic_overlap": True,
         "minimum_registration_ratio": min_registration_ratio,
         "selected_model_path": "sparse/0",
     }
+    if matching_strategy == "sequential":
+        expected_reconstruction.update(
+            {
+                "matching_overlap": overlap,
+                "matching_quadratic_overlap": True,
+            }
+        )
     for key, expected_value in expected_reconstruction.items():
         if stats.get(key) != expected_value:
             raise ValueError(
                 f"COLMAP {key} does not match manifest request: "
                 f"expected {expected_value!r}, found {stats.get(key)!r}"
             )
+    if min_source_registration_ratio is not None and not math.isclose(
+        float(stats.get("minimum_source_registration_ratio", -1)),
+        min_source_registration_ratio,
+        rel_tol=0.0,
+        abs_tol=1e-9,
+    ):
+        raise ValueError(
+            "COLMAP minimum_source_registration_ratio does not match "
+            "manifest request"
+        )
 
     image_snapshot = _image_tree_identity(dataset / "images")
     if metadata.get("images_sha256") != image_snapshot["sha256"]:
@@ -225,7 +348,7 @@ def build_manifest(
     # whenever result-affecting extraction or reconstruction behavior changes.
     identity = {
         "dataset": {
-            "source_sha256": source_snapshot["sha256"],
+            "source_sha256": source_identity,
             "extraction": {
                 "recipe_version": 1,
                 "sample_fps": sample_fps,
@@ -237,9 +360,11 @@ def build_manifest(
                 "recipe_version": 2,
                 "camera_mode": "SINGLE",
                 "camera_model": camera_model,
-                "matching": "sequential",
-                "overlap": overlap,
-                "quadratic_overlap": True,
+                "matching": matching_strategy,
+                "overlap": overlap if matching_strategy == "sequential" else None,
+                "quadratic_overlap": (
+                    True if matching_strategy == "sequential" else None
+                ),
             },
         },
         "trainer": {
@@ -283,36 +408,47 @@ def build_manifest(
                 f"COLMAP model file no longer matches reconstruction stats: "
                 f"{artifact['path']}"
             )
+    quality_gate = {
+        "min_registration_ratio": min_registration_ratio,
+        "recorded_status": stats.get("status"),
+        "registered_images": stats.get("num_registered_images"),
+        "input_images": stats.get("num_input_images"),
+    }
+    if min_source_registration_ratio is not None:
+        quality_gate["min_source_registration_ratio"] = (
+            min_source_registration_ratio
+        )
+
+    provenance: dict[str, Any] = {
+        "scene": scene,
+        "quality_gate": quality_gate,
+        "resources": {
+            "colmap_threads": colmap_threads,
+            "training_gpu": gpu_id,
+        },
+        "dataset_snapshot": {
+            "instance_id": dataset_instance_id,
+            "images": image_snapshot,
+            "artifacts": artifact_snapshots,
+            "reconstruction_stats": stats,
+        },
+        "environment": {
+            "python": sys.version.split()[0],
+            "pycolmap": _package_version("pycolmap"),
+            "torch": _package_version("torch"),
+            "gsplat": _package_version("gsplat"),
+        },
+    }
+    if is_video_set:
+        provenance["sources"] = source_snapshots
+    else:
+        provenance["source"] = source_snapshot
+
     manifest = {
         "schema_version": SCHEMA_VERSION,
         "identity": identity,
         "identity_sha256": _canonical_digest(identity),
-        "provenance": {
-            "scene": scene,
-            "source": source_snapshot,
-            "quality_gate": {
-                "min_registration_ratio": min_registration_ratio,
-                "recorded_status": stats.get("status"),
-                "registered_images": stats.get("num_registered_images"),
-                "input_images": stats.get("num_input_images"),
-            },
-            "resources": {
-                "colmap_threads": colmap_threads,
-                "training_gpu": gpu_id,
-            },
-            "dataset_snapshot": {
-                "instance_id": dataset_instance_id,
-                "images": image_snapshot,
-                "artifacts": artifact_snapshots,
-                "reconstruction_stats": stats,
-            },
-            "environment": {
-                "python": sys.version.split()[0],
-                "pycolmap": _package_version("pycolmap"),
-                "torch": _package_version("torch"),
-                "gsplat": _package_version("gsplat"),
-            },
-        },
+        "provenance": provenance,
     }
     return manifest
 
@@ -389,12 +525,24 @@ def build_parser() -> argparse.ArgumentParser:
     build = commands.add_parser("build", help="Build one manifest.")
     build.add_argument("--scene", required=True)
     build.add_argument("--dataset", required=True, type=Path)
-    build.add_argument("--source", required=True, type=Path)
+    build.add_argument(
+        "--source",
+        required=True,
+        type=Path,
+        action="append",
+        help="Source capture; repeat in dataset order for a video set.",
+    )
     build.add_argument("--gsplat-root", required=True, type=Path)
     build.add_argument("--sample-fps", required=True, type=float)
     build.add_argument("--max-frames", required=True, type=int)
     build.add_argument("--overlap", required=True, type=int)
+    build.add_argument(
+        "--matching-strategy",
+        choices=("sequential", "exhaustive"),
+        default="sequential",
+    )
     build.add_argument("--min-registration-ratio", required=True, type=float)
+    build.add_argument("--min-source-registration-ratio", type=float)
     build.add_argument("--max-steps", required=True, type=int)
     build.add_argument("--camera-model", required=True)
     build.add_argument("--colmap-threads", required=True, type=int)
@@ -439,6 +587,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             revision,
             args.colmap_threads,
             args.gpu_id,
+            args.matching_strategy,
+            args.min_source_registration_ratio,
         )
         _atomic_write_json(args.output.expanduser().resolve(), manifest)
     except (

@@ -6,6 +6,7 @@ import argparse
 import hashlib
 import json
 import math
+import re
 import shutil
 import sys
 import tempfile
@@ -157,6 +158,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="Fresh output directory; images/ and metadata.json are created here.",
     )
     parser.add_argument(
+        "--additional-video",
+        action="append",
+        default=[],
+        type=Path,
+        help=(
+            "Additional source video. Repeat to build one ordered multi-video "
+            "dataset; --max-frames applies separately to every source."
+        ),
+    )
+    parser.add_argument(
         "--sample-fps",
         type=float,
         default=3.0,
@@ -180,17 +191,18 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def create_dataset(
-    video: Path,
+def _validate_creation_request(
+    videos: Sequence[Path],
     dataset: Path,
     sample_fps: float,
     max_frames: int,
     jpeg_quality: int,
-) -> Path:
-    video = video.expanduser().resolve()
-    dataset = dataset.expanduser().resolve()
-    if not video.is_file():
-        raise FileNotFoundError(f"Video not found: {video}")
+) -> None:
+    if not videos:
+        raise ValueError("at least one source video is required")
+    for video in videos:
+        if not video.is_file():
+            raise FileNotFoundError(f"Video not found: {video}")
     if dataset.exists():
         raise FileExistsError(
             f"Dataset already exists: {dataset}. Use a fresh versioned directory."
@@ -201,6 +213,29 @@ def create_dataset(
         raise ValueError("--max-frames must be at least 2")
     if not 1 <= jpeg_quality <= 100:
         raise ValueError("--jpeg-quality must be between 1 and 100")
+
+
+def _source_prefix(index: int, video: Path) -> str:
+    stem = re.sub(r"[^a-z0-9]+", "_", video.stem.lower()).strip("_")
+    return f"{index:02d}_{stem or 'video'}_"
+
+
+def create_dataset(
+    video: Path,
+    dataset: Path,
+    sample_fps: float,
+    max_frames: int,
+    jpeg_quality: int,
+) -> Path:
+    video = video.expanduser().resolve()
+    dataset = dataset.expanduser().resolve()
+    _validate_creation_request(
+        [video],
+        dataset,
+        sample_fps,
+        max_frames,
+        jpeg_quality,
+    )
 
     dataset.parent.mkdir(parents=True, exist_ok=True)
     source_stat = video.stat()
@@ -245,16 +280,140 @@ def create_dataset(
     return dataset
 
 
+def create_video_set_dataset(
+    videos: Sequence[Path],
+    dataset: Path,
+    sample_fps: float,
+    max_frames: int,
+    jpeg_quality: int,
+) -> Path:
+    """Sample an ordered set of videos into one atomic COLMAP dataset."""
+    resolved_videos = [video.expanduser().resolve() for video in videos]
+    dataset = dataset.expanduser().resolve()
+    if len(resolved_videos) < 2:
+        raise ValueError("a video-set dataset requires at least two source videos")
+    _validate_creation_request(
+        resolved_videos,
+        dataset,
+        sample_fps,
+        max_frames,
+        jpeg_quality,
+    )
+
+    source_identities = []
+    for video in resolved_videos:
+        source_stat = video.stat()
+        print(f"Hashing source capture: {video}", flush=True)
+        source_identities.append(
+            {
+                "source_video": str(video),
+                "source_size_bytes": source_stat.st_size,
+                "source_mtime_ns": source_stat.st_mtime_ns,
+                "source_sha256": _sha256(video),
+            }
+        )
+
+    dataset.parent.mkdir(parents=True, exist_ok=True)
+    temporary = Path(
+        tempfile.mkdtemp(prefix=f".{dataset.name}.", dir=str(dataset.parent))
+    )
+    try:
+        images_dir = temporary / "images"
+        images_dir.mkdir()
+        source_records = []
+        expected_dimensions: tuple[int, int] | None = None
+        total_selected_frames = 0
+
+        for index, (video, identity) in enumerate(
+            zip(resolved_videos, source_identities, strict=True)
+        ):
+            staging_dir = temporary / f".source-{index:02d}"
+            sample = extract_frames(
+                video,
+                staging_dir,
+                sample_fps,
+                max_frames,
+                jpeg_quality,
+            )
+            dimensions = (
+                sample.output_frame_width,
+                sample.output_frame_height,
+            )
+            if expected_dimensions is None:
+                expected_dimensions = dimensions
+            elif dimensions != expected_dimensions:
+                raise ValueError(
+                    "All videos in one dataset must decode to the same output "
+                    "dimensions for shared camera calibration: "
+                    f"expected {expected_dimensions[0]}x{expected_dimensions[1]}, "
+                    f"got {dimensions[0]}x{dimensions[1]} for {video}"
+                )
+
+            image_prefix = _source_prefix(index, video)
+            for frame_index in range(len(sample.selected_indices)):
+                source_image = staging_dir / f"{frame_index:06d}.jpg"
+                target_image = images_dir / f"{image_prefix}{frame_index:06d}.jpg"
+                source_image.replace(target_image)
+            staging_dir.rmdir()
+
+            selected_count = len(sample.selected_indices)
+            total_selected_frames += selected_count
+            source_records.append(
+                {
+                    **identity,
+                    "image_prefix": image_prefix,
+                    **asdict(sample),
+                }
+            )
+
+        if expected_dimensions is None:
+            raise RuntimeError("No videos were extracted")
+        images_sha256 = _tree_sha256(images_dir)
+        metadata = {
+            "dataset_type": "video_set",
+            "dataset_instance_id": str(uuid.uuid4()),
+            "sources": source_records,
+            "total_selected_frames": total_selected_frames,
+            "output_frame_width": expected_dimensions[0],
+            "output_frame_height": expected_dimensions[1],
+            "images_sha256": images_sha256,
+            "sample_fps": sample_fps,
+            "max_frames": max_frames,
+            "jpeg_quality": jpeg_quality,
+        }
+        (temporary / "metadata.json").write_text(
+            json.dumps(metadata, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        temporary.replace(dataset)
+    except BaseException:
+        shutil.rmtree(temporary, ignore_errors=True)
+        raise
+
+    print(f"Wrote {total_selected_frames} frames to {dataset / 'images'}")
+    print(f"Dataset metadata: {dataset / 'metadata.json'}")
+    return dataset
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
-        create_dataset(
-            args.video,
-            args.dataset,
-            args.sample_fps,
-            args.max_frames,
-            args.jpeg_quality,
-        )
+        if args.additional_video:
+            create_video_set_dataset(
+                [args.video, *args.additional_video],
+                args.dataset,
+                args.sample_fps,
+                args.max_frames,
+                args.jpeg_quality,
+            )
+        else:
+            create_dataset(
+                args.video,
+                args.dataset,
+                args.sample_fps,
+                args.max_frames,
+                args.jpeg_quality,
+            )
     except (OSError, RuntimeError, ValueError) as error:
         print(f"error: {error}", file=sys.stderr)
         return 1

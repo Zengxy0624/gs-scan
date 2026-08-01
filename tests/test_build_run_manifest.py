@@ -7,7 +7,11 @@ import unittest
 import uuid
 from pathlib import Path
 
-from scripts.build_run_manifest import build_manifest, manifest_identity_matches
+from scripts.build_run_manifest import (
+    build_manifest,
+    build_parser,
+    manifest_identity_matches,
+)
 
 
 REVISION = "a" * 40
@@ -79,13 +83,58 @@ def create_dataset(root: Path, source: Path) -> Path:
     return dataset
 
 
+def source_metadata(
+    source: Path,
+    image_prefix: str,
+    selected_indices: list[int],
+) -> dict[str, object]:
+    stat = source.stat()
+    return {
+        "source_video": str(source.resolve()),
+        "source_size_bytes": stat.st_size,
+        "source_mtime_ns": stat.st_mtime_ns,
+        "source_sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
+        "image_prefix": image_prefix,
+        "selected_indices": selected_indices,
+    }
+
+
+def create_video_set_dataset(root: Path, sources: list[Path]) -> Path:
+    dataset = create_dataset(root, sources[0])
+    metadata_path = dataset / "metadata.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata["dataset_type"] = "video_set"
+    for key in (
+        "source_video",
+        "source_size_bytes",
+        "source_mtime_ns",
+        "source_sha256",
+        "selected_indices",
+    ):
+        metadata.pop(key)
+    metadata["sources"] = [
+        source_metadata(source, f"source_{index:03d}", [index])
+        for index, source in enumerate(sources)
+    ]
+    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+
+    stats_path = dataset / "reconstruction_stats.json"
+    stats = json.loads(stats_path.read_text(encoding="utf-8"))
+    stats["minimum_source_registration_ratio"] = 0.4
+    stats_path.write_text(json.dumps(stats), encoding="utf-8")
+    return dataset
+
+
 def manifest(
     dataset: Path,
-    source: Path,
+    source: Path | list[Path],
     *,
     camera_model: str = "SIMPLE_RADIAL",
     max_steps: int = 30000,
     revision: str = REVISION,
+    overlap: int = 15,
+    matching_strategy: str = "sequential",
+    min_source_registration_ratio: float | None = None,
 ) -> dict[str, object]:
     stats_path = dataset / "reconstruction_stats.json"
     original_stats = stats_path.read_text(encoding="utf-8")
@@ -99,13 +148,15 @@ def manifest(
             source,
             6.0,
             100000,
-            15,
+            overlap,
             0.5,
             max_steps,
             camera_model,
             revision,
             8,
             "6",
+            matching_strategy,
+            min_source_registration_ratio,
         )
     finally:
         stats_path.write_text(original_stats, encoding="utf-8")
@@ -123,6 +174,19 @@ class RunManifestTests(unittest.TestCase):
 
             baseline = manifest(dataset, source)
             self.assertEqual(baseline["schema_version"], 2)
+            self.assertIn("source", baseline["provenance"])
+            self.assertNotIn("sources", baseline["provenance"])
+            self.assertEqual(
+                baseline["identity"]["dataset"]["reconstruction"],
+                {
+                    "recipe_version": 2,
+                    "camera_mode": "SINGLE",
+                    "camera_model": "SIMPLE_RADIAL",
+                    "matching": "sequential",
+                    "overlap": 15,
+                    "quadratic_overlap": True,
+                },
+            )
             self.assertEqual(
                 baseline["identity"]["trainer"]["implementation"]["commit"],
                 REVISION,
@@ -264,6 +328,202 @@ class RunManifestTests(unittest.TestCase):
                     changed_same_instance_path,
                 )
             )
+
+    def test_video_set_identity_tracks_source_content_and_order(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            first = root / "inward.mov"
+            second = root / "upward.mov"
+            first.write_bytes(b"inward-source")
+            second.write_bytes(b"upward-source")
+            dataset = create_video_set_dataset(root, [first, second])
+
+            baseline = manifest(
+                dataset,
+                [first, second],
+                min_source_registration_ratio=0.4,
+            )
+            expected_hashes = [
+                hashlib.sha256(path.read_bytes()).hexdigest()
+                for path in (first, second)
+            ]
+            self.assertEqual(
+                baseline["identity"]["dataset"]["source_sha256"],
+                expected_hashes,
+            )
+            self.assertNotIn("source", baseline["provenance"])
+            self.assertEqual(
+                [
+                    snapshot["image_prefix"]
+                    for snapshot in baseline["provenance"]["sources"]
+                ],
+                ["source_000", "source_001"],
+            )
+            self.assertEqual(
+                baseline["provenance"]["sources"][1]["selected_indices"],
+                [1],
+            )
+
+            with self.assertRaisesRegex(ValueError, "content no longer matches"):
+                manifest(
+                    dataset,
+                    [second, first],
+                    min_source_registration_ratio=0.4,
+                )
+
+            second.write_bytes(b"changed-upward-source")
+            with self.assertRaisesRegex(ValueError, "content no longer matches"):
+                manifest(
+                    dataset,
+                    [first, second],
+                    min_source_registration_ratio=0.4,
+                )
+
+            metadata_path = dataset / "metadata.json"
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            metadata["sources"][1] = source_metadata(
+                second,
+                "source_001",
+                [1],
+            )
+            metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+            changed = manifest(
+                dataset,
+                [first, second],
+                min_source_registration_ratio=0.4,
+            )
+            self.assertNotEqual(
+                baseline["identity_sha256"],
+                changed["identity_sha256"],
+            )
+
+            metadata["sources"].reverse()
+            metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+            reversed_sources = manifest(
+                dataset,
+                [second, first],
+                min_source_registration_ratio=0.4,
+            )
+            self.assertEqual(
+                reversed_sources["identity"]["dataset"]["source_sha256"],
+                list(
+                    reversed(
+                        changed["identity"]["dataset"]["source_sha256"]
+                    )
+                ),
+            )
+            self.assertNotEqual(
+                changed["identity_sha256"],
+                reversed_sources["identity_sha256"],
+            )
+
+            with self.assertRaisesRegex(
+                ValueError,
+                "minimum_source_registration_ratio",
+            ):
+                manifest(
+                    dataset,
+                    [second, first],
+                    min_source_registration_ratio=0.8,
+                )
+
+    def test_matching_strategy_is_validated_and_identified(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "capture.mov"
+            source.write_bytes(b"source")
+            dataset = create_dataset(root, source)
+
+            # Legacy reconstruction stats have no matching_strategy field and
+            # remain valid as sequential reconstructions.
+            sequential = manifest(dataset, source)
+
+            stats_path = dataset / "reconstruction_stats.json"
+            stats = json.loads(stats_path.read_text(encoding="utf-8"))
+            stats["matching_strategy"] = "exhaustive"
+            # prepare_colmap records the requested overlap for diagnostics even
+            # though exhaustive matching does not use it.
+            stats["matching_overlap"] = 15
+            stats["matching_quadratic_overlap"] = False
+            stats_path.write_text(json.dumps(stats), encoding="utf-8")
+
+            exhaustive = manifest(
+                dataset,
+                source,
+                matching_strategy="exhaustive",
+            )
+            exhaustive_other_overlap = manifest(
+                dataset,
+                source,
+                overlap=999,
+                matching_strategy="exhaustive",
+            )
+            self.assertNotEqual(
+                sequential["identity_sha256"],
+                exhaustive["identity_sha256"],
+            )
+            self.assertEqual(
+                exhaustive["identity_sha256"],
+                exhaustive_other_overlap["identity_sha256"],
+            )
+            self.assertEqual(
+                exhaustive["identity"]["dataset"]["reconstruction"],
+                {
+                    "recipe_version": 2,
+                    "camera_mode": "SINGLE",
+                    "camera_model": "SIMPLE_RADIAL",
+                    "matching": "exhaustive",
+                    "overlap": None,
+                    "quadratic_overlap": None,
+                },
+            )
+            with self.assertRaisesRegex(ValueError, "matching_strategy"):
+                manifest(dataset, source)
+
+    def test_build_parser_accepts_ordered_repeatable_sources(self) -> None:
+        args = build_parser().parse_args(
+            [
+                "build",
+                "--scene",
+                "scene",
+                "--dataset",
+                "dataset",
+                "--source",
+                "inward.mov",
+                "--source",
+                "upward.mov",
+                "--gsplat-root",
+                "gsplat",
+                "--sample-fps",
+                "6",
+                "--max-frames",
+                "100000",
+                "--overlap",
+                "15",
+                "--matching-strategy",
+                "exhaustive",
+                "--min-registration-ratio",
+                "0.5",
+                "--min-source-registration-ratio",
+                "0.4",
+                "--max-steps",
+                "30000",
+                "--camera-model",
+                "OPENCV",
+                "--colmap-threads",
+                "8",
+                "--gpu-id",
+                "7",
+                "--output",
+                "run_manifest.json",
+            ]
+        )
+        self.assertEqual(
+            args.source,
+            [Path("inward.mov"), Path("upward.mov")],
+        )
+        self.assertEqual(args.matching_strategy, "exhaustive")
+        self.assertEqual(args.min_source_registration_ratio, 0.4)
 
 
 if __name__ == "__main__":
