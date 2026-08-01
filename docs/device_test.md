@@ -41,7 +41,9 @@ The full-profile defaults are:
 
 - 6 sampled frames per second;
 - at most 100,000 frames per video;
-- a dense 15-frame COLMAP match window plus sparse longer-baseline pairs;
+- one shared `OPENCV` camera calibration per video;
+- 15 COLMAP quadratic-neighbor levels (`1, 2, 4, ...` frame offsets, bounded by
+  the sequence length);
 - a minimum 50% COLMAP registration ratio for each scene;
 - 8 COLMAP CPU threads; and
 - 30,000 gsplat training steps.
@@ -55,7 +57,7 @@ Generated frames, the COLMAP database, and the sparse model are stored as
 repo-local work state:
 
 ```text
-work/device_test/fps6_max100000_overlap15_reg0.5/
+work/device_test/fps6_max100000_camopencv_overlap15_reg0.5/
 ├── insta_normal/dataset/
 ├── iphone_18mm/dataset/
 ├── iphone_24mm/dataset/
@@ -68,14 +70,14 @@ Durable training artifacts and logs are separate:
 ```text
 outputs/device_test/
 ├── insta_normal/
-│   ├── fps6_max100000_overlap15_reg0.5_30000steps/
+│   ├── fps6_max100000_camopencv_overlap15_reg0.5_30000steps/
 │   │   └── pipeline_manifest.json
 │   └── _logs/
 ├── iphone_18mm/
 ├── iphone_24mm/
 ├── osmo_rotate/
 ├── osmo_stable/
-└── summary_fps6_max100000_overlap15_reg0.5_30000steps.tsv
+└── summary_fps6_max100000_camopencv_overlap15_reg0.5_30000steps.tsv
 ```
 
 `work/` is the safe repo-local default: unlike system `/tmp`, it is less likely
@@ -113,7 +115,7 @@ bash scripts/run_device_test.sh \
   --gpu 6 \
   --scene iphone_18mm
 
-# Show all commands and paths without creating files or running stages.
+# Show planned commands and paths without creating files or running stages.
 bash scripts/run_device_test.sh --dry-run
 ```
 
@@ -126,6 +128,11 @@ cap, and expected numbered images. New caches record a content digest, so an
 identical copied or restored source is accepted even if its path or modification
 time changed. Completed COLMAP state must also match the requested camera model,
 overlap recipe, image count, and selected-model completion marker.
+
+The camera model is part of the work and result directory key. Legacy
+`SIMPLE_RADIAL` runs remain usable at their existing paths, but are not reused
+as `OPENCV` results. The new default creates separate `camopencv` directories
+and leaves those earlier artifacts untouched.
 
 Incomplete or stale work is not silently overwritten. Without
 `--retry-incomplete`, the scene fails with an explanation; with it, the batch
@@ -149,18 +156,20 @@ old state is archived, but preprocessing and any legacy training result must be
 rebuilt.
 
 `--dry-run` performs no writes. Use it to verify capture names, selected scenes,
-paths, GPU selection, and generated commands before committing server time.
+paths, GPU selection, and generated commands before committing server time. It
+prints the training command conservatively; only a real run rebuilds the
+manifest and decides whether an existing completed result is reusable.
 
 ## Compare results
 
 For a full run, the main per-scene numbers are:
 
 ```text
-outputs/device_test/<scene>/fps6_max100000_overlap15_reg0.5_30000steps/
+outputs/device_test/<scene>/fps6_max100000_camopencv_overlap15_reg0.5_30000steps/
 ├── stats/val_step29999.json       # PSNR, SSIM, LPIPS and validation timing
 └── pipeline_manifest.json         # reconstruction stats used by this result
 
-work/device_test/fps6_max100000_overlap15_reg0.5/<scene>/dataset/
+work/device_test/fps6_max100000_camopencv_overlap15_reg0.5/<scene>/dataset/
 └── reconstruction_stats.json     # most recent work reconstruction
 ```
 

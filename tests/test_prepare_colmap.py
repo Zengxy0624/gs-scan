@@ -12,11 +12,16 @@ from unittest.mock import patch
 from scripts.prepare_colmap import (
     _minimum_registered_images,
     _validate_input,
+    build_parser,
     reconstruct,
 )
 
 
 class InputValidationTests(unittest.TestCase):
+    def test_defaults_to_opencv_camera_model(self) -> None:
+        args = build_parser().parse_args(["dataset"])
+        self.assertEqual(args.camera_model, "OPENCV")
+
     def test_requires_images(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             dataset = Path(temporary)

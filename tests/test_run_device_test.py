@@ -22,6 +22,7 @@ CAPTURE_NAMES = (
     "osmo_rotate.MP4",
     "osmo_stable.MP4",
 )
+DEFAULT_PREPROCESS_KEY = "fps6_max100000_camopencv_overlap15_reg0.5"
 
 
 class DeviceBatchTests(unittest.TestCase):
@@ -228,7 +229,7 @@ else:
                 self.assertEqual(result.returncode, 2)
                 self.assertIn(expected, result.stderr)
 
-    def test_output_namespace_includes_preprocessing_parameters_not_profile(
+    def test_output_namespace_includes_reconstruction_parameters_not_profile(
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -255,7 +256,7 @@ else:
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn(
             "iphone_18mm/"
-            "fps5_max600_overlap20_reg0.5_30000steps",
+            "fps5_max600_camopencv_overlap20_reg0.5_30000steps",
             result.stdout,
         )
         self.assertNotIn("iphone_18mm/full", result.stdout)
@@ -270,7 +271,7 @@ else:
             for command in commands
             if str(TRAINER) in command and "default" in command
         )
-        key = "fps5_max600_overlap20_reg0.5"
+        key = "fps5_max600_camopencv_overlap20_reg0.5"
         self.assertEqual(
             trainer_command,
             [
@@ -332,7 +333,7 @@ else:
                 "--max-steps",
                 "30000",
                 "--camera-model",
-                "SIMPLE_RADIAL",
+                "OPENCV",
                 "--colmap-threads",
                 "8",
                 "--gpu-id",
@@ -432,7 +433,7 @@ else:
                 (
                     root
                     / "work"
-                    / "fps6_max100000_overlap15_reg0.5"
+                    / DEFAULT_PREPROCESS_KEY
                     / ".batch-lock"
                 ).exists()
             )
@@ -459,9 +460,17 @@ else:
                 "iphone_18mm",
                 extra_environment=environment,
             )
+            dry_run = self.run_script(
+                root,
+                "--dry-run",
+                "--scene",
+                "iphone_18mm",
+                extra_environment=environment,
+            )
 
             self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
             self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
+            self.assertEqual(dry_run.returncode, 0, dry_run.stdout + dry_run.stderr)
             self.assertEqual(
                 log.read_text(encoding="utf-8").splitlines(),
                 ["extract_frames.py", "prepare_colmap.py", "simple_trainer.py"],
@@ -470,7 +479,7 @@ else:
                 root
                 / "outputs"
                 / "iphone_18mm"
-                / "fps6_max100000_overlap15_reg0.5_30000steps"
+                / f"{DEFAULT_PREPROCESS_KEY}_30000steps"
             )
             manifest = json.loads(
                 (result_dir / "pipeline_manifest.json").read_text(
@@ -483,6 +492,8 @@ else:
                 30000,
             )
             self.assertIn("Skipping completed training", second.stdout)
+            self.assertIn(str(TRAINER), dry_run.stdout)
+            self.assertNotIn("Skipping completed training", dry_run.stdout)
 
     def test_rejects_cached_colmap_with_wrong_camera_model(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -502,13 +513,13 @@ else:
             stats_path = (
                 root
                 / "work"
-                / "fps6_max100000_overlap15_reg0.5"
+                / DEFAULT_PREPROCESS_KEY
                 / "iphone_18mm"
                 / "dataset"
                 / "reconstruction_stats.json"
             )
             stats = json.loads(stats_path.read_text(encoding="utf-8"))
-            stats["camera_model"] = "OPENCV"
+            stats["camera_model"] = "SIMPLE_RADIAL"
             stats_path.write_text(json.dumps(stats), encoding="utf-8")
 
             second = self.run_script(
@@ -531,7 +542,7 @@ else:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             fake_bin, log = self.make_fake_uv(root)
-            key = "fps6_max100000_overlap15_reg0.5"
+            key = DEFAULT_PREPROCESS_KEY
             lock = root / "work" / key / ".batch-lock"
             lock.mkdir(parents=True)
             (lock / "hostname").write_text(
@@ -571,7 +582,7 @@ else:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             fake_bin, log = self.make_fake_uv(root)
-            key = "fps6_max100000_overlap15_reg0.5"
+            key = DEFAULT_PREPROCESS_KEY
             lock = root / "work" / key / ".batch-lock"
             lock.mkdir(parents=True)
             (lock / "hostname").write_text(
@@ -610,7 +621,7 @@ else:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             fake_bin, log = self.make_fake_uv(root)
-            key = "fps6_max100000_overlap15_reg0.5"
+            key = DEFAULT_PREPROCESS_KEY
             lock = root / "work" / key / ".batch-lock"
             lock.mkdir(parents=True)
             (lock / "hostname").write_text(
@@ -645,7 +656,7 @@ else:
             root = Path(temporary)
             captures = self.prepare_captures(root)
             fake_bin, log = self.make_fake_uv(root)
-            key = "fps6_max100000_overlap15_reg0.5"
+            key = DEFAULT_PREPROCESS_KEY
             scene_work = root / "work" / key / "iphone_18mm"
             dataset = scene_work / "dataset"
             images = dataset / "images"

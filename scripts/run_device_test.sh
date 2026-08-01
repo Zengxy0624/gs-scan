@@ -18,6 +18,7 @@ MAX_FRAMES="100000"
 OVERLAP="15"
 COLMAP_THREADS="8"
 MIN_REGISTRATION_RATIO="0.5"
+CAMERA_MODEL="OPENCV"
 ONLY_SCENE=""
 RETRY_INCOMPLETE=0
 PREPROCESS_ONLY=0
@@ -35,7 +36,7 @@ Options:
   --gpu ID                   Physical GPU used only for training (default: 6).
   --sample-fps FPS           Uniform video sampling rate (default: 6).
   --max-frames N             Maximum sampled frames per video (default: 100000).
-  --overlap N                Dense COLMAP temporal match window (default: 15).
+  --overlap N                COLMAP quadratic-neighbor levels (default: 15).
   --colmap-threads N         COLMAP CPU threads (default: 8; -1 means all).
   --min-registration-ratio R Fail weak COLMAP models below R (default: 0.5).
   --scene NAME               Run only one named scene.
@@ -226,14 +227,6 @@ SOURCE_FILES=(
     "osmo_rotate.MP4"
     "osmo_stable.MP4"
 )
-CAMERA_MODELS=(
-    "SIMPLE_RADIAL"
-    "SIMPLE_RADIAL"
-    "SIMPLE_RADIAL"
-    "SIMPLE_RADIAL"
-    "SIMPLE_RADIAL"
-)
-
 REQUIRED_FILES=(
     "${PROJECT_ROOT}/scripts/extract_frames.py"
     "${PROJECT_ROOT}/scripts/prepare_colmap.py"
@@ -267,7 +260,10 @@ if (( DRY_RUN == 0 && PREPROCESS_ONLY == 0 )); then
     fi
 fi
 
-PREPROCESS_KEY="fps${SAMPLE_FPS}_max${MAX_FRAMES}_overlap${OVERLAP}_reg${MIN_REGISTRATION_RATIO}"
+CAMERA_MODEL_KEY="$(printf '%s' "${CAMERA_MODEL}" | tr '[:upper:]' '[:lower:]')"
+printf -v PREPROCESS_KEY 'fps%s_max%s_cam%s_overlap%s_reg%s' \
+    "${SAMPLE_FPS}" "${MAX_FRAMES}" "${CAMERA_MODEL_KEY}" \
+    "${OVERLAP}" "${MIN_REGISTRATION_RATIO}"
 WORK_EXPERIMENT="${WORK_BASE}/${PREPROCESS_KEY}"
 RUN_KEY="${PREPROCESS_KEY}_${MAX_STEPS}steps"
 FAILED_WORK_DIR="${WORK_EXPERIMENT}/_failed"
@@ -617,7 +613,10 @@ process_scene() {
     prepare_output_directory \
         "${scene}" "${result_dir}" "${failed_output_dir}" \
         "${desired_manifest}" || return 1
-    if training_complete "${result_dir}" "${desired_manifest}"; then
+    # Dry-run does not rebuild desired_manifest, so it must not use a stored
+    # copy to decide whether the current training recipe is reusable.
+    if (( DRY_RUN == 0 )) &&
+        training_complete "${result_dir}" "${desired_manifest}"; then
         echo "Skipping completed training: ${result_dir}"
         return 0
     fi
@@ -675,7 +674,7 @@ for index in "${!SCENES[@]}"; do
         process_scene \
             "${scene}" \
             "${SOURCE_FILES[index]}" \
-            "${CAMERA_MODELS[index]}"
+            "${CAMERA_MODEL}"
         scene_status=$?
         set -e
     else
@@ -687,7 +686,7 @@ for index in "${!SCENES[@]}"; do
             process_scene \
                 "${scene}" \
                 "${SOURCE_FILES[index]}" \
-                "${CAMERA_MODELS[index]}"
+                "${CAMERA_MODEL}"
         ) 2>&1 | tee -a "${log_path}"
         scene_status="${PIPESTATUS[0]}"
         set -e

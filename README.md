@@ -152,10 +152,11 @@ uv run --project third-party/gsplat --no-sync \
   --num-threads 8
 ```
 
-The defaults use one shared `SIMPLE_RADIAL` camera, a dense sequential
-video-frame match window plus sparse longer-baseline pairs, incremental
-structure from motion, and the largest recovered model. `--num-threads` bounds
-feature extraction, matching, and mapping, not just the first two stages.
+The defaults use one shared `OPENCV` camera calibration per video and match
+sequential frames at power-of-two offsets (`1, 2, 4, ...`, bounded by the
+sequence length). COLMAP then runs incremental structure from motion and keeps
+the largest recovered model. `--num-threads` bounds feature extraction,
+matching, and mapping, not just the first two stages.
 The complete dataset then contains:
 
 ```text
@@ -176,8 +177,9 @@ at least 50% of the input and at least 10 images when 10 or more are available.
 Set a deliberate threshold with `--min-registration-ratio 0.7`. Use the short
 pilot's validation renders as the visual geometry gate. If registration is
 weak, create a new dataset at 5 FPS, remove blurred frames, or recapture with
-more overlap and texture. Increasing `--overlap` helps only when the useful
-dense matching window is wider than 15 frames.
+more overlap and texture. Increasing `--overlap` adds only the next
+power-of-two frame offset; it does not make the existing offsets denser, and it
+adds nothing once that offset exceeds the sequence length.
 
 ## 5. Run a short pilot
 

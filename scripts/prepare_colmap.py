@@ -13,6 +13,7 @@ from typing import Sequence
 
 
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".webp"}
+DEFAULT_CAMERA_MODEL = "OPENCV"
 
 
 def _file_identity(path: Path) -> dict[str, object]:
@@ -42,11 +43,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--overlap",
         type=int,
         default=15,
-        help="Number of neighboring video frames to match in each direction.",
+        help=(
+            "Number of quadratic-neighbor levels: frame offsets "
+            "1, 2, 4, ..., 2^(N-1) (default: 15)."
+        ),
     )
     parser.add_argument(
         "--camera-model",
-        default="SIMPLE_RADIAL",
+        default=DEFAULT_CAMERA_MODEL,
         choices=(
             "SIMPLE_PINHOLE",
             "PINHOLE",
@@ -55,7 +59,10 @@ def build_parser() -> argparse.ArgumentParser:
             "OPENCV",
             "OPENCV_FISHEYE",
         ),
-        help="Shared COLMAP camera model for all video frames.",
+        help=(
+            "Shared COLMAP camera model for all video frames "
+            "(default: %(default)s)."
+        ),
     )
     parser.add_argument(
         "--num-threads",
@@ -183,8 +190,8 @@ def reconstruct(
     )
 
     print(
-        f"Sequentially matching with overlap={overlap} and sparse "
-        "long-baseline pairs"
+        f"Sequentially matching {overlap} quadratic-neighbor levels "
+        "at frame offsets 1, 2, 4, ..."
     )
     pairing_options = pycolmap.SequentialPairingOptions(
         overlap=overlap,
