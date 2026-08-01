@@ -101,8 +101,6 @@ class RecordPatternBatchTests(unittest.TestCase):
             "15",
             "--camera-model",
             "OPENCV",
-            "--num-threads",
-            "8",
             "--min-registration-ratio",
             "0.8",
         ]
@@ -141,7 +139,7 @@ class RecordPatternBatchTests(unittest.TestCase):
                 "--camera-model",
                 "OPENCV",
                 "--colmap-threads",
-                "8",
+                "-1",
                 "--gpu-id",
                 gpu,
                 "--output",
@@ -201,7 +199,7 @@ class RecordPatternBatchTests(unittest.TestCase):
                 scene="inward_orbit",
                 key=INWARD_KEY,
                 matching="sequential",
-                gpu="6",
+                gpu="7",
                 sources=[captures / "inward_orbit.mov"],
             )
             expected.extend(
@@ -218,8 +216,6 @@ class RecordPatternBatchTests(unittest.TestCase):
                 )
             )
 
-            # Each complete command is rendered by one printf call, so the
-            # two concurrent plans cannot merge command lines.
             for command in expected:
                 with self.subTest(command=command):
                     rendered_body = " " + shlex.join(command)
@@ -229,8 +225,10 @@ class RecordPatternBatchTests(unittest.TestCase):
             self.assertEqual(result.stdout.count(str(RECONSTRUCTOR)), 2)
             self.assertEqual(result.stdout.count(str(MANIFEST_BUILDER)), 2)
             self.assertEqual(result.stdout.count(str(TRAINER)), 2)
-            self.assertEqual(result.stdout.count("CUDA_VISIBLE_DEVICES=6"), 1)
-            self.assertEqual(result.stdout.count("CUDA_VISIBLE_DEVICES=7"), 1)
+            self.assertNotIn("CUDA_VISIBLE_DEVICES=6", result.stdout)
+            self.assertEqual(result.stdout.count("CUDA_VISIBLE_DEVICES=7"), 2)
+            self.assertNotIn("--num-threads", result.stdout)
+            self.assertEqual(result.stdout.count("--colmap-threads -1"), 2)
             self.assertEqual(result.stdout.count("--no-sync"), 6)
             self.assertNotIn("setup_gsplat.sh", result.stdout)
             self.assertNotIn("module load", result.stdout)
@@ -239,22 +237,33 @@ class RecordPatternBatchTests(unittest.TestCase):
             self.assertFalse((root / "work").exists())
             self.assertFalse((root / "outputs").exists())
 
-    def test_rejects_same_gpu_before_writing(self) -> None:
+    def test_single_gpu_option_applies_to_both_scenes(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             result = self.run_script(
                 root,
                 "--dry-run",
-                "--gpu-inward",
+                "--gpu",
                 "06",
-                "--gpu-combined",
-                "6",
             )
 
-            self.assertEqual(result.returncode, 2)
-            self.assertIn("require distinct GPU indices", result.stderr)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(result.stdout.count("CUDA_VISIBLE_DEVICES=6"), 2)
+            self.assertNotIn("CUDA_VISIBLE_DEVICES=7", result.stdout)
+            self.assertEqual(result.stdout.count("--gpu-id 6"), 2)
             self.assertFalse((root / "work").exists())
             self.assertFalse((root / "outputs").exists())
+
+    def test_help_exposes_one_gpu_option_and_no_colmap_thread_option(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            result = self.run_script(Path(temporary), "--help")
+
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn("--gpu ID", result.stdout)
+            self.assertIn("default: 7", result.stdout)
+            self.assertNotIn("--gpu-inward", result.stdout)
+            self.assertNotIn("--gpu-combined", result.stdout)
+            self.assertNotIn("--colmap-threads", result.stdout)
 
     def test_incomplete_and_live_output_locks_fail_closed(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -305,7 +314,7 @@ class RecordPatternBatchTests(unittest.TestCase):
             self.assertNotIn("Launched ", result.stdout)
             self.assertTrue(launch_lock.is_dir())
 
-    def make_overlap_uv(self, root: Path) -> Path:
+    def make_ordering_uv(self, root: Path) -> Path:
         fake_bin = root / "bin"
         fake_bin.mkdir()
         uv = fake_bin / "uv"
@@ -337,17 +346,13 @@ if script == "extract_frames.py":
 elif script == "prepare_colmap.py":
     matching = option(stage, "--matching")
     (state / f"{matching}.started").write_text(
-        str(time.monotonic_ns()), encoding="utf-8"
+        str(time.time_ns()), encoding="utf-8"
     )
-    deadline = time.monotonic() + 5
-    expected = [state / "sequential.started", state / "exhaustive.started"]
-    while not all(path.exists() for path in expected):
-        if time.monotonic() >= deadline:
-            raise SystemExit("other COLMAP phase did not start concurrently")
-        time.sleep(0.01)
-    time.sleep(0.1)
+    if matching == "exhaustive" and not (state / "sequential.ended").exists():
+        raise SystemExit("exhaustive COLMAP started before sequential ended")
+    time.sleep(0.05)
     (state / f"{matching}.ended").write_text(
-        str(time.monotonic_ns()), encoding="utf-8"
+        str(time.time_ns()), encoding="utf-8"
     )
 else:
     raise SystemExit(f"unexpected stubbed script: {script}")
@@ -357,10 +362,10 @@ else:
         uv.chmod(0o755)
         return fake_bin
 
-    def test_preprocess_only_overlaps_both_colmap_phases(self) -> None:
+    def test_preprocess_only_runs_colmap_phases_in_order(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            fake_bin = self.make_overlap_uv(root)
+            fake_bin = self.make_ordering_uv(root)
             state = root / "stub-state"
             result = self.run_script(
                 root,
@@ -372,15 +377,9 @@ else:
             )
 
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-            starts = [
-                int((state / f"{matching}.started").read_text())
-                for matching in ("sequential", "exhaustive")
-            ]
-            ends = [
-                int((state / f"{matching}.ended").read_text())
-                for matching in ("sequential", "exhaustive")
-            ]
-            self.assertLess(max(starts), min(ends))
+            sequential_end = int((state / "sequential.ended").read_text())
+            exhaustive_start = int((state / "exhaustive.started").read_text())
+            self.assertLess(sequential_end, exhaustive_start)
             self.assertEqual(result.stdout.count("Preprocessing complete for"), 2)
             self.assertFalse((root / "work" / ".batch-lock").exists())
             self.assertFalse((root / "outputs" / ".batch-lock").exists())
@@ -521,7 +520,7 @@ else:
                 stderr=subprocess.PIPE,
             )
             deadline = time.monotonic() + 10
-            while len(list(state.glob("uv-*.ready"))) < 2:
+            while len(list(state.glob("uv-*.ready"))) < 1:
                 if process.poll() is not None:
                     stdout, stderr = process.communicate()
                     self.fail(stdout + stderr)
@@ -534,8 +533,8 @@ else:
             process.terminate()
             stdout, stderr = process.communicate(timeout=15)
             self.assertEqual(process.returncode, 143, stdout + stderr)
-            self.assertEqual(len(list(state.glob("uv-*.term"))), 2)
-            self.assertEqual(len(list(state.glob("child-*.term"))), 2)
+            self.assertEqual(len(list(state.glob("uv-*.term"))), 1)
+            self.assertEqual(len(list(state.glob("child-*.term"))), 1)
             self.assertFalse((root / "work" / ".batch-lock").exists())
             self.assertFalse((root / "outputs" / ".batch-lock").exists())
 
@@ -565,22 +564,33 @@ else:
             process_groups: list[int] = []
             try:
                 deadline = time.monotonic() + 10
-                while len(list(state.glob("uv-*.ready"))) < 2:
+                pgids_path = root / "work" / ".batch-lock" / "pgids"
+                while True:
                     if process.poll() is not None:
                         self.fail("launcher exited before orphan test was ready")
                     if time.monotonic() >= deadline:
                         self.fail("stubbed uv processes did not become ready")
+                    recorded_groups = []
+                    if pgids_path.is_file():
+                        recorded_groups = [
+                            value
+                            for value in pgids_path.read_text().splitlines()
+                            if value
+                        ]
+                    if len(list(state.glob("uv-*.ready"))) == 1 and len(
+                        recorded_groups
+                    ) == 1:
+                        break
                     time.sleep(0.02)
 
                 process.kill()
                 self.assertEqual(process.wait(timeout=5), -9)
-                pgids_path = root / "work" / ".batch-lock" / "pgids"
                 process_groups = [
                     int(value)
                     for value in pgids_path.read_text().splitlines()
                     if value
                 ]
-                self.assertEqual(len(process_groups), 2)
+                self.assertEqual(len(process_groups), 1)
                 self.assertNotIn(os.getpgrp(), process_groups)
 
                 retry = subprocess.run(

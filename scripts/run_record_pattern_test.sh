@@ -12,12 +12,10 @@ WORK_BASE="${WORK_ROOT:-${PROJECT_ROOT}/work/record_pattern_test}"
 OUTPUT_BASE="${OUTPUT_ROOT:-${PROJECT_ROOT}/outputs/record_pattern_test}"
 
 PROFILE="full"
-GPU_INWARD="6"
-GPU_COMBINED="7"
+GPU_ID="7"
 SAMPLE_FPS="6"
 MAX_FRAMES="100000"
 OVERLAP="15"
-COLMAP_THREADS="8"
 MAX_EXHAUSTIVE_PAIRS="5000000"
 MIN_REGISTRATION_RATIO="0.8"
 MIN_SOURCE_REGISTRATION_RATIO="0.8"
@@ -28,8 +26,8 @@ DRY_RUN=0
 
 usage() {
     cat <<'EOF'
-Run two record-pattern reconstructions concurrently:
-  inward_orbit           -> GPU 6, sequential COLMAP
+Run two record-pattern reconstructions sequentially:
+  inward_orbit           -> GPU 7, sequential COLMAP
   inward_orbit_upward    -> GPU 7, exhaustive COLMAP over both videos
 
 Usage:
@@ -37,12 +35,10 @@ Usage:
 
 Options:
   --profile pilot|full       Train for 7,000 or 30,000 steps (default: full).
-  --gpu-inward ID            GPU for inward_orbit training (default: 6).
-  --gpu-combined ID          GPU for combined training (default: 7).
+  --gpu ID                   GPU for both training runs (default: 7).
   --sample-fps FPS           Sampling rate for each source (default: 6).
   --max-frames N             Per-video sampled-frame cap (default: 100000).
   --overlap N                Inward quadratic-neighbor levels (default: 15).
-  --colmap-threads N         CPU threads per concurrent COLMAP job (default: 8).
   --max-exhaustive-pairs N   Safety cap for the combined matcher (default: 5000000).
   --min-registration-ratio R Overall COLMAP registration gate (default: 0.8).
   --min-source-registration-ratio R
@@ -78,14 +74,9 @@ while [[ $# -gt 0 ]]; do
             PROFILE="$2"
             shift 2
             ;;
-        --gpu-inward)
+        --gpu)
             require_value "$1" "${2:-}"
-            GPU_INWARD="$2"
-            shift 2
-            ;;
-        --gpu-combined)
-            require_value "$1" "${2:-}"
-            GPU_COMBINED="$2"
+            GPU_ID="$2"
             shift 2
             ;;
         --sample-fps)
@@ -101,11 +92,6 @@ while [[ $# -gt 0 ]]; do
         --overlap)
             require_value "$1" "${2:-}"
             OVERLAP="$2"
-            shift 2
-            ;;
-        --colmap-threads)
-            require_value "$1" "${2:-}"
-            COLMAP_THREADS="$2"
             shift 2
             ;;
         --max-exhaustive-pairs)
@@ -187,14 +173,8 @@ validate_gpu() {
     fi
 }
 
-validate_gpu "${GPU_INWARD}" "--gpu-inward"
-validate_gpu "${GPU_COMBINED}" "--gpu-combined"
-GPU_INWARD="$((10#${GPU_INWARD}))"
-GPU_COMBINED="$((10#${GPU_COMBINED}))"
-if [[ "${GPU_INWARD}" == "${GPU_COMBINED}" ]]; then
-    echo "error: the two jobs require distinct GPU indices" >&2
-    exit 2
-fi
+validate_gpu "${GPU_ID}" "--gpu"
+GPU_ID="$((10#${GPU_ID}))"
 if [[ ! "${SAMPLE_FPS}" =~ ^([0-9]+)([.][0-9]+)?$ ]] ||
     [[ "${SAMPLE_FPS}" =~ ^0+([.]0+)?$ ]]; then
     echo "error: --sample-fps must be positive" >&2
@@ -217,15 +197,6 @@ fi
 OVERLAP="$((10#${OVERLAP}))"
 if (( OVERLAP < 1 )); then
     echo "error: --overlap must be a positive integer" >&2
-    exit 2
-fi
-if [[ ! "${COLMAP_THREADS}" =~ ^[0-9]+$ ]]; then
-    echo "error: --colmap-threads must be a positive integer per job" >&2
-    exit 2
-fi
-COLMAP_THREADS="$((10#${COLMAP_THREADS}))"
-if (( COLMAP_THREADS < 1 )); then
-    echo "error: --colmap-threads must be a positive integer per job" >&2
     exit 2
 fi
 if [[ ! "${MAX_EXHAUSTIVE_PAIRS}" =~ ^[0-9]+$ ]]; then
@@ -297,12 +268,10 @@ if (( DRY_RUN == 0 && PREPROCESS_ONLY == 0 )); then
         echo "error: nvidia-smi is required for training" >&2
         exit 1
     fi
-    for gpu_id in "${GPU_INWARD}" "${GPU_COMBINED}"; do
-        if ! nvidia-smi -i "${gpu_id}" >/dev/null; then
-            echo "error: GPU ${gpu_id} is not visible to nvidia-smi" >&2
-            exit 1
-        fi
-    done
+    if ! nvidia-smi -i "${GPU_ID}" >/dev/null; then
+        echo "error: GPU ${GPU_ID} is not visible to nvidia-smi" >&2
+        exit 1
+    fi
 fi
 
 cleanup_locks() {
@@ -842,7 +811,7 @@ process_scene() {
     echo
     echo "=== ${scene} ==="
     echo "Sources: ${sources[*]}"
-    echo "COLMAP: ${matching_strategy}, ${COLMAP_THREADS} CPU threads"
+    echo "COLMAP: ${matching_strategy}, automatic CPU thread count"
     if (( PREPROCESS_ONLY == 0 )); then
         echo "Training GPU: ${gpu_id}"
     fi
@@ -891,7 +860,6 @@ process_scene() {
             --matching "${matching_strategy}"
             --overlap "${OVERLAP}"
             --camera-model "${CAMERA_MODEL}"
-            --num-threads "${COLMAP_THREADS}"
             --min-registration-ratio "${MIN_REGISTRATION_RATIO}"
         )
         if [[ -n "${min_source_ratio}" ]]; then
@@ -928,7 +896,7 @@ process_scene() {
         --min-registration-ratio "${MIN_REGISTRATION_RATIO}"
         --max-steps "${MAX_STEPS}"
         --camera-model "${CAMERA_MODEL}"
-        --colmap-threads "${COLMAP_THREADS}"
+        --colmap-threads -1
         --gpu-id "${gpu_id}"
         --output "${desired_manifest}"
     )
@@ -993,10 +961,10 @@ launch_scene() {
     mark_launch_in_progress
     if (( DRY_RUN == 1 )); then
         if (( index == 0 )); then
-            (process_scene "${scene}" sequential "${GPU_INWARD}" "" \
+            (process_scene "${scene}" sequential "${GPU_ID}" "" \
                 "${INWARD_VIDEO}") &
         else
-            (process_scene "${scene}" exhaustive "${GPU_COMBINED}" \
+            (process_scene "${scene}" exhaustive "${GPU_ID}" \
                 "${MIN_SOURCE_REGISTRATION_RATIO}" \
                 "${INWARD_VIDEO}" "${UPWARD_VIDEO}") &
         fi
@@ -1005,13 +973,13 @@ launch_scene() {
         if (( index == 0 )); then
             (
                 set -Eeuo pipefail
-                process_scene "${scene}" sequential "${GPU_INWARD}" "" \
+                process_scene "${scene}" sequential "${GPU_ID}" "" \
                     "${INWARD_VIDEO}" 2>&1 | tee -a "${log_path}"
             ) &
         else
             (
                 set -Eeuo pipefail
-                process_scene "${scene}" exhaustive "${GPU_COMBINED}" \
+                process_scene "${scene}" exhaustive "${GPU_ID}" \
                     "${MIN_SOURCE_REGISTRATION_RATIO}" \
                     "${INWARD_VIDEO}" "${UPWARD_VIDEO}" 2>&1 | tee -a "${log_path}"
             ) &
@@ -1024,11 +992,8 @@ launch_scene() {
 }
 
 set -m
-launch_scene 0
-launch_scene 1
-set +m
-
 for index in "${!SCENES[@]}"; do
+    launch_scene "${index}"
     child_pid="${CHILD_PIDS[index]}"
     set +e
     wait "${child_pid}"
@@ -1037,6 +1002,7 @@ for index in "${!SCENES[@]}"; do
     write_active_process_groups
     set -e
 done
+set +m
 CHILD_PIDS=()
 
 successful_scenes=()

@@ -5,13 +5,13 @@ record-pattern captures:
 
 | Scene | Source video(s) | COLMAP matching | Training GPU |
 | --- | --- | --- | --- |
-| `inward_orbit` | `inward_orbit.mov` | Sequential | 6 |
+| `inward_orbit` | `inward_orbit.mov` | Sequential | 7 |
 | `inward_orbit_upward` | `inward_orbit.mov`, then `upward.mov` | Exhaustive | 7 |
 
-The two complete jobs run concurrently, like starting them in two terminals.
-Their frame extraction and CPU COLMAP stages are independent. As soon as one
-job finishes COLMAP, it can begin training on its assigned GPU while the other
-job continues.
+The launcher runs the two complete jobs one after the other: it finishes the
+`inward_orbit` reconstruction and training before starting
+`inward_orbit_upward`. Only one CPU-heavy COLMAP stage runs at a time, and both
+training runs can use the same physical GPU safely.
 
 ## Server command
 
@@ -78,23 +78,18 @@ and `upward.mov`. If either source falls below the per-source gate, training is
 not started; this prevents an apparently successful combined result that
 actually discarded one of the videos.
 
-COLMAP runs on the CPU. Both jobs use 8 CPU threads by default, so two active
-COLMAP stages can request roughly 16 worker threads in total. Adjust the
-per-job limit on a shared server, for example:
+COLMAP runs on the CPU, and the launcher does not pass an explicit
+`--num-threads` limit. `prepare_colmap.py` therefore uses PyCOLMAP's automatic
+default (`-1`) for each reconstruction, one at a time. This can use all CPUs
+made available to the process by the server or scheduler; request an
+appropriate CPU allocation before starting the batch on a managed cluster.
+
+Only gsplat training uses the GPU. Both scenes train sequentially on physical
+GPU 7 through a process-local `CUDA_VISIBLE_DEVICES` setting. Select a
+different physical GPU when necessary:
 
 ```bash
-bash scripts/run_record_pattern_test.sh --colmap-threads 4
-```
-
-Only gsplat training uses the GPUs. Physical GPU 6 is assigned to
-`inward_orbit`, and physical GPU 7 to `inward_orbit_upward`, through a
-process-local `CUDA_VISIBLE_DEVICES` setting. Override them with distinct GPU
-indices if necessary:
-
-```bash
-bash scripts/run_record_pattern_test.sh \
-  --gpu-inward 6 \
-  --gpu-combined 7
+bash scripts/run_record_pattern_test.sh --gpu 6
 ```
 
 ## Work, results, and logs
@@ -170,7 +165,8 @@ COLMAP, or using a GPU:
 bash scripts/run_record_pattern_test.sh --dry-run
 ```
 
-Extract frames and run both COLMAP jobs, but do not train:
+Extract frames and run both COLMAP reconstructions sequentially, but do not
+train:
 
 ```bash
 bash scripts/run_record_pattern_test.sh --preprocess-only
@@ -195,15 +191,15 @@ directory; it does not silently overwrite them. Batch locks under both
 from operating on the same work or result tree simultaneously. Foreign-host,
 live-process, and incomplete locks fail closed instead of being overwritten.
 
-Ctrl-C, HUP, or TERM is forwarded to both complete job process groups, including
-their `uv`, Python, COLMAP, and training descendants. The launcher waits about
-five seconds before escalating surviving groups to `KILL`. If it still cannot
-verify cleanup, it deliberately retains `cleanup-incomplete` locks; inspect the
-server processes before removing those locks manually.
+Ctrl-C, HUP, or TERM is forwarded to the active job process group, including
+its `uv`, Python, COLMAP, and training descendants. The launcher waits about
+five seconds before escalating a surviving group to `KILL`. If it still cannot
+verify cleanup, it deliberately retains `cleanup-incomplete` locks; inspect
+the server processes before removing those locks manually.
 
-The locks also record both active job process-group IDs. If the launcher itself
+The locks also record the active job process-group ID. If the launcher itself
 is forcibly killed and cannot run cleanup, the next invocation refuses to
-archive its dead-owner locks while either recorded group is still alive. A
+archive its dead-owner locks while that recorded group is still alive. A
 `launch-in-progress` marker also closes the brief process-spawn/metadata window;
 if that marker survives a dead owner, inspect processes and remove the lock
 manually only after confirming no job remains.
