@@ -50,7 +50,7 @@ which predate it. Common recipe since exp4b: `mcmc --strategy.cap-max 6500000
 | `exp7_boot_r1` | merged_gpu_r1 | exp6 recipe + bootstrap data | 24.46* | 0.818 | 0.367 | 7,030,921 | **bootstrap works**: +0.28 dB vs exp6 on 168 shared frames; targeted videos +0.31…+0.77, others +0.17. (*headline depressed: val includes ~195 hard candidate frames) |
 | `exp8_sharp040` | merged_gpu_sharp040 | exp6 recipe + mild deblur | 24.64* | 0.820 | 0.352 | 6,500,000 | LPIPS −0.0075 vs exp6 on 122 shared frames; PSNR flat |
 | `exp10_sharp050a20` | merged_gpu_sharp050a20 | exp6 recipe + aggressive deblur | 24.68* | 0.813 | 0.349 | 6,500,000 | LPIPS −0.0056 vs exp8 on 95 shared frames (72/95 improved); PSNR flat |
-| `exp11_boot_sharp` | merged_gpu_r1_sharp050a20 | bootstrap + aggressive deblur combined | (running) | | | | production-model candidate |
+| `exp11_boot_sharp` | merged_gpu_r1_sharp050a20 | bootstrap + aggressive deblur combined | 24.54* | 0.812 | 0.359 | 6,500,000 | **PRODUCTION MODEL**: beats exp7 (+0.15 dB, LPIPS −0.011 on 96 shared) and edges exp10 (+0.03 dB, LPIPS −0.002 on 173 shared); only model with both data fixes. Use `ply/point_cloud_119999_pruned005.ply` |
 
 (*) headline on that run's own split — see comparability note at top.
 
@@ -82,8 +82,8 @@ which predate it. Common recipe since exp4b: `mcmc --strategy.cap-max 6500000
 - [x] Bootstrap pipeline built, unit-tested, validated end-to-end on real data
 - [x] Round 1: sample → blur-gate → register → score → exp7
 - [x] Deblur arm: exp8 (mild), exp10 (aggressive)
-- [ ] **exp11** (running): compare vs exp7 and exp10 on shared frames; if it
-      wins both → production model, pruned PLY export
+- [x] **exp11 = production model** (wins both pairwise comparisons); pruned
+      PLY exported; traj video not rendered (tmux died mid-render, cosmetic)
 - [x] Advisor asks: wandb mirroring in `train_experiment.py`
       (`WANDB_PROJECT=...`), `scripts/export_rerun_viz.py` (.rrd), plus a
       shareable WebGL SfM explorer artifact; splat webviews live in the
