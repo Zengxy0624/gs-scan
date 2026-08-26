@@ -15,6 +15,12 @@ gsplat submodule (which must stay clean for manifest provenance):
    steps (``dist/*``), making fog formation and reset-recovery visible live
    instead of requiring post-hoc checkpoint analysis.
 
+W&B mirroring: set ``WANDB_PROJECT=ambulance-3dgs`` in the environment to
+mirror every TensorBoard scalar plus up to four validation canvases per eval
+to Weights & Biases (add ``WANDB_MODE=offline`` to record locally and upload
+later with ``wandb sync``). No new CLI flags; without ``WANDB_PROJECT`` set,
+behavior is unchanged.
+
 Deviation from upstream eval: side-by-side render PNGs are written for every
 8th validation image instead of all of them (a full pass writes gigabytes).
 
@@ -27,10 +33,14 @@ from __future__ import annotations
 
 import csv
 import json
+import math
+import os
 import sys
 import time
 from collections import defaultdict
 from pathlib import Path
+from types import ModuleType
+from typing import Sequence
 
 _EXAMPLES = Path(__file__).resolve().parents[1] / "third-party" / "gsplat" / "examples"
 sys.path.insert(0, str(_EXAMPLES))
@@ -52,6 +62,9 @@ def _source_prefix(image_name: str) -> str:
 
 
 class ExperimentRunner(Runner):
+    #: wandb module handle when mirroring is active on this rank (see main()).
+    _wandb: ModuleType | None = None
+
     @torch.no_grad()
     def eval(self, step: int, stage: str = "val"):
         """Upstream eval plus per-image and per-source metric dumps."""
@@ -67,6 +80,7 @@ class ExperimentRunner(Runner):
         ellipse_time = 0.0
         metrics = defaultdict(list)
         per_image: list[dict[str, object]] = []
+        mirror_canvases: list[str] = []
         import imageio.v2 as imageio
 
         for i, data in enumerate(valloader):
@@ -101,10 +115,10 @@ class ExperimentRunner(Runner):
                 canvas = (
                     torch.cat([pixels, colors], dim=2).squeeze(0).cpu().numpy()
                 )
-                imageio.imwrite(
-                    f"{self.render_dir}/{stage}_step{step}_{i:04d}.png",
-                    (canvas * 255).astype(np.uint8),
-                )
+                canvas_path = f"{self.render_dir}/{stage}_step{step}_{i:04d}.png"
+                imageio.imwrite(canvas_path, (canvas * 255).astype(np.uint8))
+                if i % 64 == 0:
+                    mirror_canvases.append(canvas_path)
 
             pixels_p = pixels.permute(0, 3, 1, 2)
             colors_p = colors.permute(0, 3, 1, 2)
@@ -172,6 +186,8 @@ class ExperimentRunner(Runner):
             "Worst sources: "
             + "; ".join(f"{k} {v['psnr']:.2f}dB (n={v['count']})" for k, v in worst)
         )
+        if self._wandb is not None:
+            _log_eval_renders(self._wandb, stage, step, mirror_canvases)
         self.writer.flush()
 
 
@@ -211,6 +227,77 @@ def _wrap_strategy_distribution_logging(runner: Runner) -> None:
     strategy.step_post_backward = wrapped
 
 
+def _sanitize_config(config: dict[str, object]) -> dict[str, object]:
+    """Coerce config values W&B cannot JSON-serialize (Paths, dataclasses)."""
+
+    def sanitize(value: object) -> object:
+        if value is None or isinstance(value, (bool, int, float, str)):
+            return value
+        if isinstance(value, (list, tuple)):
+            return [sanitize(item) for item in value]
+        if isinstance(value, dict):
+            return {str(key): sanitize(item) for key, item in value.items()}
+        return str(value)
+
+    return {str(key): sanitize(value) for key, value in config.items()}
+
+
+def _mirror_writer_to_wandb(runner: Runner, wandb_module: ModuleType) -> None:
+    """Send every TensorBoard scalar to W&B as well (same tag, same step)."""
+    writer = runner.writer
+    original = writer.add_scalar
+
+    def wrapped(tag, scalar_value, global_step=None, *args, **kwargs):
+        result = original(tag, scalar_value, global_step, *args, **kwargs)
+        try:
+            value = float(scalar_value)
+        except (TypeError, ValueError):
+            return result
+        if math.isfinite(value):
+            wandb_module.log({tag: value}, step=global_step)
+        return result
+
+    writer.add_scalar = wrapped
+
+
+def _log_eval_renders(
+    wandb_module: ModuleType,
+    stage: str,
+    step: int,
+    canvas_paths: Sequence[str],
+) -> None:
+    """Log up to four just-written side-by-side canvases for one eval pass."""
+    if not canvas_paths:
+        return
+    images = [wandb_module.Image(path) for path in canvas_paths[:4]]
+    wandb_module.log({f"{stage}_renders": images}, step=step)
+
+
+def _maybe_activate_wandb(
+    runner: Runner, cfg: Config, world_rank: int
+) -> ModuleType | None:
+    """Mirror the TensorBoard stream to W&B when WANDB_PROJECT is set.
+
+    Activation is environment-driven (``wandb.init`` natively picks up
+    WANDB_PROJECT, WANDB_MODE, ...), so the tyro-generated CLI stays
+    unchanged. Returns the wandb module when mirroring is active.
+    """
+    if world_rank != 0 or not os.environ.get("WANDB_PROJECT"):
+        return None
+    try:
+        import wandb
+    except ImportError as exc:
+        raise RuntimeError(
+            "WANDB_PROJECT is set but the wandb package is not installed; "
+            "install it in the training environment (pip install wandb) "
+            "or unset WANDB_PROJECT"
+        ) from exc
+    wandb.init(name=Path(cfg.result_dir).name, config=_sanitize_config(vars(cfg)))
+    _mirror_writer_to_wandb(runner, wandb)
+    runner._wandb = wandb
+    return wandb
+
+
 def main(local_rank: int, world_rank: int, world_size: int, cfg: Config) -> None:
     if cfg.post_processing is not None:
         raise NotImplementedError(
@@ -224,7 +311,12 @@ def main(local_rank: int, world_rank: int, world_size: int, cfg: Config) -> None
         _wrap_strategy_distribution_logging(runner)
     if cfg.ckpt is not None:
         raise NotImplementedError("eval-only mode: use simple_trainer.py directly")
-    runner.train()
+    wandb_module = _maybe_activate_wandb(runner, cfg, world_rank)
+    try:
+        runner.train()
+    finally:
+        if wandb_module is not None:
+            wandb_module.finish()
 
 
 if __name__ == "__main__":
