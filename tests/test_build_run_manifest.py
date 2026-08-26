@@ -179,7 +179,7 @@ class RunManifestTests(unittest.TestCase):
             self.assertEqual(
                 baseline["identity"]["dataset"]["reconstruction"],
                 {
-                    "recipe_version": 2,
+                    "recipe_version": 3,
                     "camera_mode": "SINGLE",
                     "camera_model": "SIMPLE_RADIAL",
                     "matching": "sequential",
@@ -469,7 +469,7 @@ class RunManifestTests(unittest.TestCase):
             self.assertEqual(
                 exhaustive["identity"]["dataset"]["reconstruction"],
                 {
-                    "recipe_version": 2,
+                    "recipe_version": 3,
                     "camera_mode": "SINGLE",
                     "camera_model": "SIMPLE_RADIAL",
                     "matching": "exhaustive",
@@ -479,6 +479,93 @@ class RunManifestTests(unittest.TestCase):
             )
             with self.assertRaisesRegex(ValueError, "matching_strategy"):
                 manifest(dataset, source)
+
+    def test_vocab_tree_identity_tracks_full_reconstruction_config(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "capture.mov"
+            source.write_bytes(b"source")
+            vocab_path = root / "vocab.bin"
+            vocab_path.write_bytes(b"vocabulary tree")
+            dataset = create_dataset(root, source)
+            stats_path = dataset / "reconstruction_stats.json"
+            stats = json.loads(stats_path.read_text(encoding="utf-8"))
+            stats.update(
+                {
+                    "camera_mode": "SINGLE",
+                    "matching_strategy": "vocab_tree",
+                    "matching_quadratic_overlap": False,
+                    "vocab_tree": {
+                        "num_images": 200,
+                        "num_nearest_neighbors": 5,
+                        "num_checks": 256,
+                        "num_images_after_verification": 0,
+                        "max_num_features": -1,
+                        "path": str(vocab_path.resolve()),
+                        "sha256": hashlib.sha256(
+                            vocab_path.read_bytes()
+                        ).hexdigest(),
+                    },
+                    "feature_extraction": {
+                        "max_image_size": 3200,
+                        "max_num_features": 8192,
+                        "estimate_affine_shape": True,
+                        "domain_size_pooling": True,
+                    },
+                    "feature_matching": {"guided_matching": True},
+                    "mapper": {"init_min_tri_angle": 8.0},
+                }
+            )
+            stats_path.write_text(json.dumps(stats), encoding="utf-8")
+
+            baseline = manifest(
+                dataset,
+                source,
+                matching_strategy="vocab_tree",
+            )
+            other_overlap = manifest(
+                dataset,
+                source,
+                overlap=999,
+                matching_strategy="vocab_tree",
+            )
+            reconstruction = baseline["identity"]["dataset"]["reconstruction"]
+            self.assertEqual(reconstruction["recipe_version"], 3)
+            self.assertEqual(reconstruction["matching"], "vocab_tree")
+            self.assertIsNone(reconstruction["overlap"])
+            self.assertIsNone(reconstruction["quadratic_overlap"])
+            for name in (
+                "vocab_tree",
+                "feature_extraction",
+                "feature_matching",
+                "mapper",
+            ):
+                self.assertEqual(reconstruction[name], stats[name])
+            self.assertEqual(
+                baseline["identity_sha256"],
+                other_overlap["identity_sha256"],
+            )
+
+            stats["feature_matching"]["guided_matching"] = False
+            stats_path.write_text(json.dumps(stats), encoding="utf-8")
+            changed = manifest(
+                dataset,
+                source,
+                matching_strategy="vocab_tree",
+            )
+            self.assertNotEqual(
+                baseline["identity_sha256"],
+                changed["identity_sha256"],
+            )
+
+            stats["vocab_tree"]["sha256"] = "not-a-digest"
+            stats_path.write_text(json.dumps(stats), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "digest"):
+                manifest(
+                    dataset,
+                    source,
+                    matching_strategy="vocab_tree",
+                )
 
     def test_build_parser_accepts_ordered_repeatable_sources(self) -> None:
         args = build_parser().parse_args(
@@ -501,7 +588,7 @@ class RunManifestTests(unittest.TestCase):
                 "--overlap",
                 "15",
                 "--matching-strategy",
-                "exhaustive",
+                "vocab_tree",
                 "--min-registration-ratio",
                 "0.5",
                 "--min-source-registration-ratio",
@@ -522,7 +609,7 @@ class RunManifestTests(unittest.TestCase):
             args.source,
             [Path("inward.mov"), Path("upward.mov")],
         )
-        self.assertEqual(args.matching_strategy, "exhaustive")
+        self.assertEqual(args.matching_strategy, "vocab_tree")
         self.assertEqual(args.min_source_registration_ratio, 0.4)
 
 

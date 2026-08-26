@@ -15,6 +15,7 @@ from typing import Any, Sequence
 
 
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".webp"}
+MATCHING_STRATEGIES = {"sequential", "exhaustive", "vocab_tree"}
 
 
 def _sha256(path: Path) -> str:
@@ -262,6 +263,142 @@ def _validate_source_registration(
         raise ValueError("cached COLMAP per-source quality gate is inconsistent")
 
 
+def _nested_config(stats: dict[str, Any], name: str) -> dict[str, Any]:
+    config = stats.get(name)
+    if not isinstance(config, dict):
+        raise ValueError(f"cached COLMAP {name} config is missing or invalid")
+    return config
+
+
+def _positive_integer(config: dict[str, Any], key: str, label: str) -> int:
+    value = config.get(key)
+    if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+        raise ValueError(f"cached COLMAP {label} is invalid")
+    return value
+
+
+def _nonnegative_integer(config: dict[str, Any], key: str, label: str) -> int:
+    value = config.get(key)
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        raise ValueError(f"cached COLMAP {label} is invalid")
+    return value
+
+
+def _feature_limit(config: dict[str, Any], key: str, label: str) -> int:
+    value = config.get(key)
+    if (
+        not isinstance(value, int)
+        or isinstance(value, bool)
+        or (value != -1 and value < 1)
+    ):
+        raise ValueError(f"cached COLMAP {label} is invalid")
+    return value
+
+
+def _boolean(config: dict[str, Any], key: str, label: str) -> bool:
+    value = config.get(key)
+    if not isinstance(value, bool):
+        raise ValueError(f"cached COLMAP {label} is invalid")
+    return value
+
+
+def _positive_float(config: dict[str, Any], key: str, label: str) -> float:
+    value = config.get(key)
+    if (
+        not isinstance(value, (int, float))
+        or isinstance(value, bool)
+        or not math.isfinite(float(value))
+        or float(value) <= 0
+    ):
+        raise ValueError(f"cached COLMAP {label} is invalid")
+    return float(value)
+
+
+def _validate_vocab_tree_stats(
+    stats: dict[str, Any],
+) -> tuple[
+    dict[str, Any],
+    dict[str, Any],
+    dict[str, Any],
+    dict[str, Any],
+]:
+    if stats.get("camera_mode") != "SINGLE":
+        raise ValueError("cached COLMAP camera_mode is not SINGLE")
+
+    vocab_tree = _nested_config(stats, "vocab_tree")
+    feature_extraction = _nested_config(stats, "feature_extraction")
+    feature_matching = _nested_config(stats, "feature_matching")
+    mapper = _nested_config(stats, "mapper")
+
+    _positive_integer(vocab_tree, "num_images", "vocab-tree num_images")
+    _positive_integer(
+        vocab_tree,
+        "num_nearest_neighbors",
+        "vocab-tree num_nearest_neighbors",
+    )
+    _positive_integer(vocab_tree, "num_checks", "vocab-tree num_checks")
+    _nonnegative_integer(
+        vocab_tree,
+        "num_images_after_verification",
+        "vocab-tree num_images_after_verification",
+    )
+    _feature_limit(
+        vocab_tree,
+        "max_num_features",
+        "vocab-tree max_num_features",
+    )
+    vocab_path = vocab_tree.get("path")
+    if not isinstance(vocab_path, str) or not vocab_path:
+        raise ValueError("cached COLMAP vocabulary-tree path is invalid")
+    vocab_digest = vocab_tree.get("sha256")
+    if (
+        not isinstance(vocab_digest, str)
+        or re.fullmatch(r"[0-9a-f]{64}", vocab_digest) is None
+    ):
+        raise ValueError("cached COLMAP vocabulary-tree digest is invalid")
+
+    _positive_integer(
+        feature_extraction,
+        "max_image_size",
+        "feature-extraction max_image_size",
+    )
+    _positive_integer(
+        feature_extraction,
+        "max_num_features",
+        "feature-extraction max_num_features",
+    )
+    _boolean(
+        feature_extraction,
+        "estimate_affine_shape",
+        "feature-extraction estimate_affine_shape",
+    )
+    _boolean(
+        feature_extraction,
+        "domain_size_pooling",
+        "feature-extraction domain_size_pooling",
+    )
+    _boolean(
+        feature_matching,
+        "guided_matching",
+        "feature-matching guided_matching",
+    )
+    _positive_float(mapper, "init_min_tri_angle", "mapper init_min_tri_angle")
+    return vocab_tree, feature_extraction, feature_matching, mapper
+
+
+def _validate_requested_vocab_tree_path(
+    config: dict[str, Any],
+    requested_path: Path,
+) -> None:
+    requested = requested_path.expanduser().resolve()
+    if not requested.is_file():
+        raise FileNotFoundError(f"Vocabulary tree not found: {requested}")
+    if _sha256(requested) != config["sha256"]:
+        raise ValueError(
+            "cached COLMAP vocabulary-tree file does not match this run"
+        )
+
+
 def validate_cache(
     dataset: Path,
     source: Path | Sequence[Path],
@@ -274,6 +411,14 @@ def validate_cache(
     require_colmap: bool = False,
     matching_strategy: str | None = None,
     min_source_registration_ratio: float | None = None,
+    vocab_tree_num_images: int | None = None,
+    guided_matching: bool | None = None,
+    sift_affine_shape: bool | None = None,
+    sift_domain_size_pooling: bool | None = None,
+    feature_max_image_size: int | None = None,
+    feature_max_num_features: int | None = None,
+    init_min_tri_angle: float | None = None,
+    vocab_tree: Path | None = None,
 ) -> None:
     dataset = dataset.expanduser().resolve()
     metadata_path = dataset / "metadata.json"
@@ -356,9 +501,10 @@ def validate_cache(
     if camera_model is not None and stats.get("camera_model") != camera_model:
         raise ValueError("cached COLMAP camera_model does not match this run")
     if matching_strategy is not None:
-        if matching_strategy not in {"sequential", "exhaustive"}:
+        if matching_strategy not in MATCHING_STRATEGIES:
             raise ValueError(
-                "matching_strategy must be 'sequential' or 'exhaustive'"
+                "matching_strategy must be 'sequential', 'exhaustive', or "
+                "'vocab_tree'"
             )
         recorded_matching_strategy = stats.get(
             "matching_strategy",
@@ -368,6 +514,111 @@ def validate_cache(
             raise ValueError(
                 "cached COLMAP matching_strategy does not match this run"
             )
+
+    recorded_matching_strategy = stats.get("matching_strategy", "sequential")
+    vocab_configs_requested = any(
+        value is not None
+        for value in (
+            vocab_tree_num_images,
+            guided_matching,
+            sift_affine_shape,
+            sift_domain_size_pooling,
+            feature_max_image_size,
+            feature_max_num_features,
+            init_min_tri_angle,
+            vocab_tree,
+        )
+    )
+    if vocab_configs_requested and recorded_matching_strategy != "vocab_tree":
+        raise ValueError(
+            "vocabulary-tree config validation requires a vocab_tree "
+            "reconstruction"
+        )
+    if recorded_matching_strategy == "vocab_tree":
+        (
+            vocab_tree_config,
+            feature_extraction_config,
+            feature_matching_config,
+            mapper_config,
+        ) = _validate_vocab_tree_stats(stats)
+        requested_integers = (
+            (
+                vocab_tree_num_images,
+                vocab_tree_config,
+                "num_images",
+                "vocab-tree num_images",
+            ),
+            (
+                feature_max_image_size,
+                feature_extraction_config,
+                "max_image_size",
+                "feature-extraction max_image_size",
+            ),
+            (
+                feature_max_num_features,
+                feature_extraction_config,
+                "max_num_features",
+                "feature-extraction max_num_features",
+            ),
+        )
+        for requested, config, key, label in requested_integers:
+            if requested is None:
+                continue
+            if (
+                not isinstance(requested, int)
+                or isinstance(requested, bool)
+                or requested < 1
+            ):
+                raise ValueError(f"{label} must be a positive integer")
+            if config.get(key) != requested:
+                raise ValueError(
+                    f"cached COLMAP {label} does not match this run"
+                )
+        requested_booleans = (
+            (
+                guided_matching,
+                feature_matching_config,
+                "guided_matching",
+                "feature-matching guided_matching",
+            ),
+            (
+                sift_affine_shape,
+                feature_extraction_config,
+                "estimate_affine_shape",
+                "feature-extraction estimate_affine_shape",
+            ),
+            (
+                sift_domain_size_pooling,
+                feature_extraction_config,
+                "domain_size_pooling",
+                "feature-extraction domain_size_pooling",
+            ),
+        )
+        for requested, config, key, label in requested_booleans:
+            if requested is not None and config.get(key) is not requested:
+                raise ValueError(
+                    f"cached COLMAP {label} does not match this run"
+                )
+        if init_min_tri_angle is not None:
+            if (
+                not isinstance(init_min_tri_angle, (int, float))
+                or isinstance(init_min_tri_angle, bool)
+                or not math.isfinite(float(init_min_tri_angle))
+                or init_min_tri_angle <= 0
+            ):
+                raise ValueError("mapper init_min_tri_angle must be positive")
+            if not math.isclose(
+                float(mapper_config.get("init_min_tri_angle", -1)),
+                float(init_min_tri_angle),
+                rel_tol=0.0,
+                abs_tol=1e-9,
+            ):
+                raise ValueError(
+                    "cached COLMAP mapper init_min_tri_angle does not match "
+                    "this run"
+                )
+        if vocab_tree is not None:
+            _validate_requested_vocab_tree_path(vocab_tree_config, vocab_tree)
     if overlap is not None and stats.get("matching_overlap") != overlap:
         raise ValueError("cached COLMAP overlap does not match this run")
     if (
@@ -435,7 +686,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--camera-model")
     parser.add_argument(
         "--matching-strategy",
-        choices=("sequential", "exhaustive"),
+        choices=("sequential", "exhaustive", "vocab_tree"),
     )
     parser.add_argument("--overlap", type=int)
     parser.add_argument(
@@ -445,6 +696,26 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--min-registration-ratio", type=float)
     parser.add_argument("--min-source-registration-ratio", type=float)
+    parser.add_argument("--vocab-tree-num-images", type=int)
+    parser.add_argument(
+        "--guided-matching",
+        action="store_true",
+        default=None,
+    )
+    parser.add_argument(
+        "--sift-affine-shape",
+        action="store_true",
+        default=None,
+    )
+    parser.add_argument(
+        "--sift-domain-size-pooling",
+        action="store_true",
+        default=None,
+    )
+    parser.add_argument("--feature-max-image-size", type=int)
+    parser.add_argument("--feature-max-num-features", type=int)
+    parser.add_argument("--init-min-tri-angle", type=float)
+    parser.add_argument("--vocab-tree", type=Path)
     parser.add_argument("--require-colmap", action="store_true")
     return parser
 
@@ -453,17 +724,25 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
         validate_cache(
-            args.dataset,
-            args.source,
-            args.sample_fps,
-            args.max_frames,
-            args.camera_model,
-            args.overlap,
-            args.quadratic_overlap,
-            args.min_registration_ratio,
-            args.require_colmap,
-            args.matching_strategy,
-            args.min_source_registration_ratio,
+            dataset=args.dataset,
+            source=args.source,
+            sample_fps=args.sample_fps,
+            max_frames=args.max_frames,
+            camera_model=args.camera_model,
+            overlap=args.overlap,
+            quadratic_overlap=args.quadratic_overlap,
+            min_registration_ratio=args.min_registration_ratio,
+            require_colmap=args.require_colmap,
+            matching_strategy=args.matching_strategy,
+            min_source_registration_ratio=args.min_source_registration_ratio,
+            vocab_tree_num_images=args.vocab_tree_num_images,
+            guided_matching=args.guided_matching,
+            sift_affine_shape=args.sift_affine_shape,
+            sift_domain_size_pooling=args.sift_domain_size_pooling,
+            feature_max_image_size=args.feature_max_image_size,
+            feature_max_num_features=args.feature_max_num_features,
+            init_min_tri_angle=args.init_min_tri_angle,
+            vocab_tree=args.vocab_tree,
         )
     except (json.JSONDecodeError, OSError, TypeError, ValueError) as error:
         print(f"error: {error}", file=sys.stderr)

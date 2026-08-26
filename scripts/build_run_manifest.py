@@ -26,6 +26,7 @@ CAMERA_MODELS = {
     "OPENCV",
     "OPENCV_FISHEYE",
 }
+MATCHING_STRATEGIES = {"sequential", "exhaustive", "vocab_tree"}
 
 
 def _sha256(path: Path) -> str:
@@ -223,6 +224,142 @@ def _clean_git_revision(repository: Path) -> str:
     return revision
 
 
+def _required_config(stats: dict[str, Any], name: str) -> dict[str, Any]:
+    config = stats.get(name)
+    if not isinstance(config, dict):
+        raise ValueError(f"COLMAP {name} config is missing or invalid")
+    return config
+
+
+def _require_integer(
+    config: dict[str, Any],
+    key: str,
+    label: str,
+    *,
+    minimum: int,
+) -> None:
+    value = config.get(key)
+    if (
+        not isinstance(value, int)
+        or isinstance(value, bool)
+        or value < minimum
+    ):
+        raise ValueError(f"COLMAP {label} is invalid")
+
+
+def _require_feature_limit(
+    config: dict[str, Any],
+    key: str,
+    label: str,
+) -> None:
+    value = config.get(key)
+    if (
+        not isinstance(value, int)
+        or isinstance(value, bool)
+        or (value != -1 and value < 1)
+    ):
+        raise ValueError(f"COLMAP {label} is invalid")
+
+
+def _require_boolean(config: dict[str, Any], key: str, label: str) -> None:
+    if not isinstance(config.get(key), bool):
+        raise ValueError(f"COLMAP {label} is invalid")
+
+
+def _vocab_tree_reconstruction_configs(
+    stats: dict[str, Any],
+) -> dict[str, dict[str, Any]]:
+    if stats.get("camera_mode") != "SINGLE":
+        raise ValueError("COLMAP camera_mode must be SINGLE for vocab_tree")
+
+    vocab_tree = _required_config(stats, "vocab_tree")
+    feature_extraction = _required_config(stats, "feature_extraction")
+    feature_matching = _required_config(stats, "feature_matching")
+    mapper = _required_config(stats, "mapper")
+
+    _require_integer(
+        vocab_tree,
+        "num_images",
+        "vocab-tree num_images",
+        minimum=1,
+    )
+    _require_integer(
+        vocab_tree,
+        "num_nearest_neighbors",
+        "vocab-tree num_nearest_neighbors",
+        minimum=1,
+    )
+    _require_integer(
+        vocab_tree,
+        "num_checks",
+        "vocab-tree num_checks",
+        minimum=1,
+    )
+    _require_integer(
+        vocab_tree,
+        "num_images_after_verification",
+        "vocab-tree num_images_after_verification",
+        minimum=0,
+    )
+    _require_feature_limit(
+        vocab_tree,
+        "max_num_features",
+        "vocab-tree max_num_features",
+    )
+    vocab_path = vocab_tree.get("path")
+    if not isinstance(vocab_path, str) or not vocab_path:
+        raise ValueError("COLMAP vocabulary-tree path is invalid")
+    vocab_digest = vocab_tree.get("sha256")
+    if (
+        not isinstance(vocab_digest, str)
+        or re.fullmatch(r"[0-9a-f]{64}", vocab_digest) is None
+    ):
+        raise ValueError("COLMAP vocabulary-tree digest is invalid")
+
+    _require_integer(
+        feature_extraction,
+        "max_image_size",
+        "feature-extraction max_image_size",
+        minimum=1,
+    )
+    _require_integer(
+        feature_extraction,
+        "max_num_features",
+        "feature-extraction max_num_features",
+        minimum=1,
+    )
+    _require_boolean(
+        feature_extraction,
+        "estimate_affine_shape",
+        "feature-extraction estimate_affine_shape",
+    )
+    _require_boolean(
+        feature_extraction,
+        "domain_size_pooling",
+        "feature-extraction domain_size_pooling",
+    )
+    _require_boolean(
+        feature_matching,
+        "guided_matching",
+        "feature-matching guided_matching",
+    )
+    init_min_tri_angle = mapper.get("init_min_tri_angle")
+    if (
+        not isinstance(init_min_tri_angle, (int, float))
+        or isinstance(init_min_tri_angle, bool)
+        or not math.isfinite(float(init_min_tri_angle))
+        or float(init_min_tri_angle) <= 0
+    ):
+        raise ValueError("COLMAP mapper init_min_tri_angle is invalid")
+
+    return {
+        "vocab_tree": vocab_tree,
+        "feature_extraction": feature_extraction,
+        "feature_matching": feature_matching,
+        "mapper": mapper,
+    }
+
+
 def build_manifest(
     scene: str,
     dataset: Path,
@@ -248,9 +385,10 @@ def build_manifest(
         raise ValueError("sample_fps must be positive and finite")
     if max_frames < 2:
         raise ValueError("max_frames must be at least 2")
-    if matching_strategy not in {"sequential", "exhaustive"}:
+    if matching_strategy not in MATCHING_STRATEGIES:
         raise ValueError(
-            "matching_strategy must be 'sequential' or 'exhaustive'"
+            "matching_strategy must be 'sequential', 'exhaustive', or "
+            "'vocab_tree'"
         )
     if matching_strategy == "sequential" and overlap < 1:
         raise ValueError("overlap must be positive")
@@ -323,6 +461,8 @@ def build_manifest(
                 "matching_quadratic_overlap": True,
             }
         )
+    elif matching_strategy == "vocab_tree":
+        expected_reconstruction["camera_mode"] = "SINGLE"
     for key, expected_value in expected_reconstruction.items():
         if stats.get(key) != expected_value:
             raise ValueError(
@@ -340,12 +480,28 @@ def build_manifest(
             "manifest request"
         )
 
+    vocab_tree_configs: dict[str, dict[str, Any]] = {}
+    if matching_strategy == "vocab_tree":
+        vocab_tree_configs = _vocab_tree_reconstruction_configs(stats)
+
     image_snapshot = _image_tree_identity(dataset / "images")
     if metadata.get("images_sha256") != image_snapshot["sha256"]:
         raise ValueError("Extracted-image content no longer matches frame metadata")
 
     # These recipe versions are semantic cache keys. Bump the relevant value
     # whenever result-affecting extraction or reconstruction behavior changes.
+    reconstruction_identity: dict[str, Any] = {
+        "recipe_version": 3,
+        "camera_mode": "SINGLE",
+        "camera_model": camera_model,
+        "matching": matching_strategy,
+        "overlap": overlap if matching_strategy == "sequential" else None,
+        "quadratic_overlap": (
+            True if matching_strategy == "sequential" else None
+        ),
+    }
+    reconstruction_identity.update(vocab_tree_configs)
+
     identity = {
         "dataset": {
             "source_sha256": source_identity,
@@ -356,16 +512,7 @@ def build_manifest(
                 "jpeg_quality": metadata.get("jpeg_quality", 95),
                 "images_sha256": image_snapshot["sha256"],
             },
-            "reconstruction": {
-                "recipe_version": 2,
-                "camera_mode": "SINGLE",
-                "camera_model": camera_model,
-                "matching": matching_strategy,
-                "overlap": overlap if matching_strategy == "sequential" else None,
-                "quadratic_overlap": (
-                    True if matching_strategy == "sequential" else None
-                ),
-            },
+            "reconstruction": reconstruction_identity,
         },
         "trainer": {
             "implementation": {
@@ -538,7 +685,7 @@ def build_parser() -> argparse.ArgumentParser:
     build.add_argument("--overlap", required=True, type=int)
     build.add_argument(
         "--matching-strategy",
-        choices=("sequential", "exhaustive"),
+        choices=("sequential", "exhaustive", "vocab_tree"),
         default="sequential",
     )
     build.add_argument("--min-registration-ratio", required=True, type=float)

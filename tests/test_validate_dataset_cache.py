@@ -143,6 +143,9 @@ class DatasetCacheValidationTests(unittest.TestCase):
                 ]
             )
             self.assertEqual(args.source, [inward, upward])
+            self.assertIsNone(args.guided_matching)
+            self.assertIsNone(args.sift_affine_shape)
+            self.assertIsNone(args.sift_domain_size_pooling)
 
     def test_video_set_rejects_source_order_and_mutation(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -276,6 +279,127 @@ class DatasetCacheValidationTests(unittest.TestCase):
                     6.0,
                     100000,
                     min_source_registration_ratio=0.8,
+                )
+
+    def test_validates_vocab_tree_configuration_and_cli(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            inward = root / "inward_orbit.mov"
+            upward = root / "upward.mov"
+            inward.write_bytes(b"inward")
+            upward.write_bytes(b"upward")
+            vocab_path = root / "vocab.bin"
+            vocab_path.write_bytes(b"vocabulary tree")
+            dataset = create_video_set_cache(root, [inward, upward])
+            stats_path = dataset / "reconstruction_stats.json"
+            stats = json.loads(stats_path.read_text(encoding="utf-8"))
+            stats.update(
+                {
+                    "camera_mode": "SINGLE",
+                    "matching_strategy": "vocab_tree",
+                    "matching_quadratic_overlap": False,
+                    "vocab_tree": {
+                        "num_images": 200,
+                        "num_nearest_neighbors": 5,
+                        "num_checks": 256,
+                        "num_images_after_verification": 0,
+                        "max_num_features": -1,
+                        "path": str(vocab_path.resolve()),
+                        "sha256": hashlib.sha256(
+                            vocab_path.read_bytes()
+                        ).hexdigest(),
+                    },
+                    "feature_extraction": {
+                        "max_image_size": 3200,
+                        "max_num_features": 8192,
+                        "estimate_affine_shape": True,
+                        "domain_size_pooling": True,
+                    },
+                    "feature_matching": {"guided_matching": True},
+                    "mapper": {"init_min_tri_angle": 8.0},
+                }
+            )
+            stats_path.write_text(json.dumps(stats), encoding="utf-8")
+
+            validate_cache(
+                dataset,
+                [inward, upward],
+                6.0,
+                100000,
+                require_colmap=True,
+                matching_strategy="vocab_tree",
+                vocab_tree_num_images=200,
+                guided_matching=True,
+                sift_affine_shape=True,
+                sift_domain_size_pooling=True,
+                feature_max_image_size=3200,
+                feature_max_num_features=8192,
+                init_min_tri_angle=8.0,
+                vocab_tree=vocab_path,
+            )
+            args = build_parser().parse_args(
+                [
+                    str(dataset),
+                    str(inward),
+                    str(upward),
+                    "--sample-fps",
+                    "6",
+                    "--max-frames",
+                    "100000",
+                    "--matching-strategy",
+                    "vocab_tree",
+                    "--vocab-tree-num-images",
+                    "200",
+                    "--guided-matching",
+                    "--sift-affine-shape",
+                    "--sift-domain-size-pooling",
+                    "--feature-max-image-size",
+                    "3200",
+                    "--feature-max-num-features",
+                    "8192",
+                    "--init-min-tri-angle",
+                    "8",
+                    "--vocab-tree",
+                    str(vocab_path),
+                ]
+            )
+            self.assertEqual(args.matching_strategy, "vocab_tree")
+            self.assertEqual(args.vocab_tree_num_images, 200)
+            self.assertIs(args.guided_matching, True)
+            self.assertIs(args.sift_affine_shape, True)
+            self.assertIs(args.sift_domain_size_pooling, True)
+            self.assertEqual(args.vocab_tree, vocab_path)
+
+            with self.assertRaisesRegex(ValueError, "max_image_size"):
+                validate_cache(
+                    dataset,
+                    [inward, upward],
+                    6.0,
+                    100000,
+                    matching_strategy="vocab_tree",
+                    feature_max_image_size=1600,
+                )
+
+            vocab_path.write_bytes(b"different vocabulary tree")
+            with self.assertRaisesRegex(ValueError, "vocabulary-tree file"):
+                validate_cache(
+                    dataset,
+                    [inward, upward],
+                    6.0,
+                    100000,
+                    matching_strategy="vocab_tree",
+                    vocab_tree=vocab_path,
+                )
+
+            stats["mapper"]["init_min_tri_angle"] = -1
+            stats_path.write_text(json.dumps(stats), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "init_min_tri_angle"):
+                validate_cache(
+                    dataset,
+                    [inward, upward],
+                    6.0,
+                    100000,
+                    matching_strategy="vocab_tree",
                 )
 
     def test_accepts_matching_single_video(self) -> None:
