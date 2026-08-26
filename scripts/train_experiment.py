@@ -298,6 +298,39 @@ def _maybe_activate_wandb(
     return wandb
 
 
+def _render_traj_from_checkpoint(runner: Runner, cfg: Config) -> None:
+    """Load a training checkpoint and render only the trajectory video.
+
+    Upstream's eval-only branch restores the splats but silently leaves an
+    ``--app-opt`` appearance module randomly initialized, which garbles the
+    colors. This restores both, then renders ``videos/traj_<step>.mp4``.
+    """
+    ckpts = [
+        torch.load(file, map_location=runner.device, weights_only=True)
+        for file in cfg.ckpt
+    ]
+    for key in runner.splats.keys():
+        runner.splats[key].data = torch.cat(
+            [ckpt["splats"][key] for ckpt in ckpts]
+        )
+    runner.scene = st.GaussianScene.from_splats(runner.splats, id="scene")
+    runner.splats = runner.scene.splats
+    runner.stage = st.Stage()
+    runner.stage.add_scene(runner.scene, runner.rasterize_splats)
+    app_state = ckpts[0].get("app_module")
+    app_module = getattr(runner, "app_module", None)
+    if app_module is not None:
+        if app_state is None:
+            raise RuntimeError(
+                "--app-opt is set but the checkpoint has no app_module state"
+            )
+        module = getattr(app_module, "module", app_module)
+        module.load_state_dict(app_state)
+    step = ckpts[0]["step"]
+    print(f"Rendering trajectory from checkpoint at step {step}")
+    runner.render_traj(step=step)
+
+
 def main(local_rank: int, world_rank: int, world_size: int, cfg: Config) -> None:
     if cfg.post_processing is not None:
         raise NotImplementedError(
@@ -310,7 +343,8 @@ def main(local_rank: int, world_rank: int, world_size: int, cfg: Config) -> None
     if world_rank == 0:
         _wrap_strategy_distribution_logging(runner)
     if cfg.ckpt is not None:
-        raise NotImplementedError("eval-only mode: use simple_trainer.py directly")
+        _render_traj_from_checkpoint(runner, cfg)
+        return
     wandb_module = _maybe_activate_wandb(runner, cfg, world_rank)
     try:
         runner.train()
