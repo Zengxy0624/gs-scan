@@ -11,3 +11,7 @@ work/
 *.MP4
 *.mp4
 *.mkv
+.pytest_cache/
+
+# Vendored binary shim; fetch per third-party/openblas-threaded/README.md.
+third-party/openblas-threaded/*.so*
