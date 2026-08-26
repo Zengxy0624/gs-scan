@@ -19,22 +19,27 @@ aligned with that reference pipeline.
 
 ```text
 3DGS-Health/
-├── scripts/
-│   ├── extract_frames.py        # one video -> dataset/images/*.jpg
-│   ├── prepare_colmap.py        # images -> database.db + sparse/0
-│   ├── run_device_test.sh       # one-command, five-video comparison batch
-│   ├── build_run_manifest.py    # bind results to source/model/code provenance
-│   ├── validate_dataset_cache.py
-│   └── setup_gsplat.sh          # pinned server environment
+├── scripts/                     # full pipeline; see scripts/README.md for the
+│   │                            #   per-script index (frames -> COLMAP ->
+│   │                            #   training -> curation -> bootstrap loop)
+│   └── README.md
 ├── docs/
-│   └── device_test.md            # five-video server batch runbook
+│   ├── EXPERIMENTS.md            # THE experiment ledger: datasets, runs,
+│   │                             #   numbers, verdicts, queue/progress
+│   ├── device_test.md            # five-video server batch runbook
+│   └── record_pattern_test.md
 ├── tests/                       # local-safe regression and smoke tests
+│                                #   (one test_*.py per script)
 ├── captures/                    # ignored raw inputs
-├── work/                        # ignored frames and COLMAP state
+├── work/                        # ignored frames, COLMAP state, datasets
 ├── outputs/                     # ignored durable gsplat results
-└── third-party/
-    └── gsplat/                   # official pinned Git submodule
+└── third-party/                 # vendored deps; see third-party/README.md
+    ├── gsplat/                   # official pinned Git submodule (never modify)
+    └── openblas-threaded/        # pthread OpenBLAS shim for pycolmap matching
 ```
+
+Start with `docs/EXPERIMENTS.md` for what has been run and what is queued, and
+`scripts/README.md` for how each stage is invoked.
 
 The scripts and tests are project-owned. `third-party/gsplat` is an unmodified
 checkout of the official
