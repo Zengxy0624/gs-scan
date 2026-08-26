@@ -50,6 +50,15 @@ except where noted).
   PLY at their COLMAP poses, rank by exposure-neutralized PSNR (worst = best
   round-2 targets).
 
+**Tracking & visualization**
+- `export_rerun_viz.py` — export a COLMAP sparse model (points + camera poses
+  colored by source video) to a `.rrd` file for the rerun viewer
+  (`rerun file.rrd` or drag-drop at rerun.io/viewer).
+- W&B mirroring lives inside `train_experiment.py`: set
+  `WANDB_PROJECT=ambulance-3dgs` (optionally `WANDB_MODE=offline`) and every
+  TensorBoard scalar plus eval render canvases mirror to wandb; unset = no
+  behavior change.
+
 **Provenance / environment**
 - `build_run_manifest.py` — bind a training run to source/model/code identity.
 - `validate_dataset_cache.py` — verify frame caches against their metadata.

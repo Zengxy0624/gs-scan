@@ -84,8 +84,11 @@ which predate it. Common recipe since exp4b: `mcmc --strategy.cap-max 6500000
 - [x] Deblur arm: exp8 (mild), exp10 (aggressive)
 - [ ] **exp11** (running): compare vs exp7 and exp10 on shared frames; if it
       wins both → production model, pruned PLY export
-- [ ] Advisor asks: wandb tracking for gsplat training; web viz of sparse SfM
-      points + camera poses (rerun.io or custom)
+- [x] Advisor asks: wandb mirroring in `train_experiment.py`
+      (`WANDB_PROJECT=...`), `scripts/export_rerun_viz.py` (.rrd), plus a
+      shareable WebGL SfM explorer artifact; splat webviews live in the
+      user's SuperSplat scenes repo (WenzhouDing/3DGS-Health-Scenes, PLY→SOG
+      — feed it the `_pruned005.ply` exports)
 - [ ] Round 2 (decision-gated): dense 60fps sampling of the two c004 door
       windows (~300 frames) → register into exp11's dataset → retrain
 - [ ] Ceiling capture pass (when filming is possible)
