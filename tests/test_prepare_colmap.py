@@ -23,6 +23,14 @@ class InputValidationTests(unittest.TestCase):
         self.assertEqual(args.camera_model, "OPENCV")
         self.assertEqual(args.matching, "sequential")
         self.assertIsNone(args.min_source_registration_ratio)
+        self.assertEqual(args.vocab_tree_num_images, 100)
+        self.assertIsNone(args.vocab_tree)
+        self.assertFalse(args.guided_matching)
+        self.assertFalse(args.sift_affine_shape)
+        self.assertFalse(args.sift_domain_size_pooling)
+        self.assertIsNone(args.feature_max_image_size)
+        self.assertIsNone(args.feature_max_num_features)
+        self.assertIsNone(args.init_min_tri_angle)
 
     def test_requires_images(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -62,6 +70,70 @@ class InputValidationTests(unittest.TestCase):
             (sparse / "partial.bin").write_bytes(b"partial")
             with self.assertRaises(FileExistsError):
                 _validate_input(dataset, overlap=15)
+
+    def test_reuse_matches_requires_and_accepts_existing_database(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            dataset = Path(temporary)
+            images = dataset / "images"
+            images.mkdir()
+            (images / "000000.jpg").write_bytes(b"image")
+            (images / "000001.jpg").write_bytes(b"image")
+
+            with self.assertRaises(FileNotFoundError):
+                _validate_input(dataset, overlap=15, reuse_matches=True)
+
+            (dataset / "database.db").write_bytes(b"database")
+            _validate_input(dataset, overlap=15, reuse_matches=True)
+
+            # Non-empty sparse output is refused even when reusing matches.
+            sparse = dataset / "sparse"
+            sparse.mkdir()
+            (sparse / "partial.bin").write_bytes(b"partial")
+            with self.assertRaises(FileExistsError):
+                _validate_input(dataset, overlap=15, reuse_matches=True)
+
+    def test_resume_model_requires_reuse_and_complete_model(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            dataset = Path(temporary)
+            snapshot = dataset / "snapshots" / "123"
+            snapshot.mkdir(parents=True)
+
+            with self.assertRaisesRegex(ValueError, "--reuse-matches"):
+                reconstruct(
+                    dataset,
+                    overlap=15,
+                    camera_model="OPENCV",
+                    resume_model=snapshot,
+                )
+
+            with self.assertRaisesRegex(FileNotFoundError, "not a complete"):
+                reconstruct(
+                    dataset,
+                    overlap=15,
+                    camera_model="OPENCV",
+                    reuse_matches=True,
+                    resume_model=snapshot,
+                )
+
+    def test_rejects_invalid_mapper_tuning(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            dataset = Path(temporary)
+            cases = (
+                {"ba_global_frames_ratio": 1.0},
+                {"ba_global_points_ratio": 0.9},
+                {"ba_global_max_refinements": 0},
+                {"ba_global_max_num_iterations": 0},
+                {"snapshot_frames_freq": 0},
+            )
+            for overrides in cases:
+                with self.subTest(overrides=overrides):
+                    with self.assertRaises(ValueError):
+                        reconstruct(
+                            dataset,
+                            overlap=15,
+                            camera_model="OPENCV",
+                            **overrides,
+                        )
 
     def test_registration_threshold_uses_ten_image_floor_when_available(self) -> None:
         self.assertEqual(_minimum_registered_images(8, 0.5), 8)
@@ -232,12 +304,31 @@ class OrchestrationTests(unittest.TestCase):
             self.assertEqual(
                 stats,
                 {
+                    "camera_mode": "SINGLE",
                     "camera_model": "OPENCV_FISHEYE",
+                    "feature_extraction": {
+                        "max_image_size": 3200,
+                        "max_num_features": 8192,
+                        "estimate_affine_shape": False,
+                        "domain_size_pooling": False,
+                    },
+                    "feature_matching": {"guided_matching": False},
                     "matching_strategy": "sequential",
                     "matching_overlap": 9,
                     "matching_quadratic_overlap": True,
                     "minimum_registered_images": 10,
                     "minimum_registration_ratio": 0.5,
+                    "mapper": {
+                        "init_min_tri_angle": 16.0,
+                        "ba_global_frames_ratio": 1.1,
+                        "ba_global_points_ratio": 1.1,
+                        "ba_global_max_refinements": 5,
+                        "ba_global_max_num_iterations": 50,
+                    },
+                    "ba_use_gpu": False,
+                    "reused_matches": False,
+                    "resumed_from_model": None,
+                    "snapshot_frames_freq": 0,
                     "num_input_images": 12,
                     "num_points3D": 50,
                     "num_registered_images": 10,
@@ -329,6 +420,279 @@ class OrchestrationTests(unittest.TestCase):
             )
             self.assertEqual(stats["matching_strategy"], "exhaustive")
             self.assertFalse(stats["matching_quadratic_overlap"])
+
+    def test_vocab_tree_matching_applies_and_records_quality_options(self) -> None:
+        calls: list[tuple[str, dict[str, object]]] = []
+        reconstruction = FakeReconstruction(registered=10, points=50)
+
+        class BasicOptions:
+            def __init__(self, **kwargs: object) -> None:
+                self.kwargs = kwargs
+
+        class FeatureExtractionOptions:
+            def __init__(self, **kwargs: object) -> None:
+                self.kwargs = kwargs
+                self.num_threads = int(kwargs["num_threads"])
+                self.max_image_size = 3200
+                self.sift = types.SimpleNamespace(
+                    max_num_features=8192,
+                    estimate_affine_shape=False,
+                    domain_size_pooling=False,
+                )
+
+        class FeatureMatchingOptions:
+            def __init__(self, **kwargs: object) -> None:
+                self.kwargs = kwargs
+                self.num_threads = int(kwargs["num_threads"])
+                self.use_gpu = bool(kwargs["use_gpu"])
+                self.guided_matching = False
+
+        class VocabTreePairingOptions:
+            def __init__(self, **kwargs: object) -> None:
+                self.kwargs = kwargs
+                self.num_images = int(kwargs["num_images"])
+                self.num_threads = int(kwargs["num_threads"])
+                self.num_nearest_neighbors = 5
+                self.num_checks = 64
+                self.num_images_after_verification = 0
+                self.max_num_features = -1
+                self.vocab_tree_path = str(
+                    kwargs.get("vocab_tree_path", "default-vocab-tree-spec")
+                )
+
+        class IncrementalPipelineOptions:
+            def __init__(self, **kwargs: object) -> None:
+                self.kwargs = kwargs
+                self.num_threads = int(kwargs["num_threads"])
+                self.mapper = types.SimpleNamespace(init_min_tri_angle=16.0)
+
+        def record(name: str, result: object = None):
+            def function(**kwargs: object) -> object:
+                calls.append((name, kwargs))
+                return result
+
+            return function
+
+        fake_pycolmap = types.SimpleNamespace(
+            __version__="test",
+            CameraMode=types.SimpleNamespace(SINGLE="single"),
+            Device=types.SimpleNamespace(cpu="cpu"),
+            ImageReaderOptions=BasicOptions,
+            FeatureExtractionOptions=FeatureExtractionOptions,
+            FeatureMatchingOptions=FeatureMatchingOptions,
+            VocabTreePairingOptions=VocabTreePairingOptions,
+            IncrementalPipelineOptions=IncrementalPipelineOptions,
+            extract_features=record("extract_features"),
+            match_vocabtree=record("match_vocabtree"),
+            incremental_mapping=record(
+                "incremental_mapping",
+                {0: reconstruction},
+            ),
+        )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            dataset = Path(temporary).resolve()
+            images = dataset / "images"
+            images.mkdir()
+            for index in range(12):
+                (images / f"{index:06d}.jpg").write_bytes(b"image")
+            vocab_tree = dataset / "vocab-tree.bin"
+            vocab_tree.write_bytes(b"local vocabulary tree")
+
+            with patch.dict(sys.modules, {"pycolmap": fake_pycolmap}):
+                reconstruct(
+                    dataset,
+                    overlap=9,
+                    camera_model="OPENCV",
+                    num_threads=5,
+                    matching_strategy="vocab_tree",
+                    vocab_tree_num_images=200,
+                    vocab_tree=vocab_tree,
+                    guided_matching=True,
+                    sift_affine_shape=True,
+                    sift_domain_size_pooling=True,
+                    feature_max_image_size=4096,
+                    feature_max_num_features=12000,
+                    init_min_tri_angle=8.0,
+                )
+
+            self.assertEqual(
+                [name for name, _ in calls],
+                ["extract_features", "match_vocabtree", "incremental_mapping"],
+            )
+            extraction_options = calls[0][1]["extraction_options"]
+            self.assertEqual(extraction_options.kwargs, {"num_threads": 5})
+            self.assertEqual(extraction_options.max_image_size, 4096)
+            self.assertEqual(extraction_options.sift.max_num_features, 12000)
+            self.assertTrue(extraction_options.sift.estimate_affine_shape)
+            self.assertTrue(extraction_options.sift.domain_size_pooling)
+
+            match_call = calls[1][1]
+            pairing_options = match_call["pairing_options"]
+            self.assertEqual(
+                pairing_options.kwargs,
+                {
+                    "num_images": 200,
+                    "num_threads": 5,
+                    "vocab_tree_path": str(vocab_tree),
+                },
+            )
+            self.assertEqual(pairing_options.max_num_features, 12000)
+            self.assertTrue(match_call["matching_options"].guided_matching)
+            self.assertEqual(match_call["device"], "cpu")
+            mapping_options = calls[2][1]["options"]
+            self.assertEqual(mapping_options.mapper.init_min_tri_angle, 8.0)
+
+            stats = json.loads(
+                (dataset / "reconstruction_stats.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(stats["camera_mode"], "SINGLE")
+            self.assertEqual(
+                stats["feature_extraction"],
+                {
+                    "max_image_size": 4096,
+                    "max_num_features": 12000,
+                    "estimate_affine_shape": True,
+                    "domain_size_pooling": True,
+                },
+            )
+            self.assertEqual(
+                stats["feature_matching"],
+                {"guided_matching": True},
+            )
+            self.assertEqual(
+                stats["mapper"],
+                {
+                    "init_min_tri_angle": 8.0,
+                    "ba_global_frames_ratio": 1.1,
+                    "ba_global_points_ratio": 1.1,
+                    "ba_global_max_refinements": 5,
+                    "ba_global_max_num_iterations": 50,
+                },
+            )
+            self.assertEqual(
+                stats["vocab_tree"],
+                {
+                    "num_images": 200,
+                    "num_nearest_neighbors": 5,
+                    "num_checks": 64,
+                    "num_images_after_verification": 0,
+                    "max_num_features": 12000,
+                    "path": str(vocab_tree),
+                    "sha256": hashlib.sha256(
+                        vocab_tree.read_bytes()
+                    ).hexdigest(),
+                },
+            )
+            self.assertEqual(stats["matching_strategy"], "vocab_tree")
+            self.assertFalse(stats["matching_quadratic_overlap"])
+
+    def test_reuse_matches_skips_extraction_and_matching_and_tunes_mapper(
+        self,
+    ) -> None:
+        calls: list[tuple[str, dict[str, object]]] = []
+        reconstruction = FakeReconstruction(registered=10, points=50)
+
+        class Options:
+            def __init__(self, **kwargs: object) -> None:
+                self.kwargs = kwargs
+
+        class IncrementalPipelineOptions:
+            def __init__(self, **kwargs: object) -> None:
+                self.kwargs = kwargs
+                self.mapper = types.SimpleNamespace(init_min_tri_angle=16.0)
+                self.snapshot_path = ""
+                self.snapshot_frames_freq = 0
+
+        def record(name: str, result: object = None):
+            def function(**kwargs: object) -> object:
+                calls.append((name, kwargs))
+                return result
+
+            return function
+
+        fake_pycolmap = types.SimpleNamespace(
+            __version__="test",
+            CameraMode=types.SimpleNamespace(SINGLE="single"),
+            Device=types.SimpleNamespace(cpu="cpu"),
+            ImageReaderOptions=Options,
+            FeatureExtractionOptions=Options,
+            FeatureMatchingOptions=Options,
+            SequentialPairingOptions=Options,
+            IncrementalPipelineOptions=IncrementalPipelineOptions,
+            extract_features=record("extract_features"),
+            match_sequential=record("match_sequential"),
+            incremental_mapping=record(
+                "incremental_mapping",
+                {0: reconstruction},
+            ),
+        )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            dataset = Path(temporary).resolve()
+            images = dataset / "images"
+            images.mkdir()
+            for index in range(12):
+                (images / f"{index:06d}.jpg").write_bytes(b"image")
+            (dataset / "database.db").write_bytes(b"existing matches")
+            snapshot = dataset / "snapshots" / "1786700000000"
+            snapshot.mkdir(parents=True)
+            for name in ("cameras.bin", "images.bin", "points3D.bin"):
+                (snapshot / name).write_bytes(b"model")
+
+            with patch.dict(sys.modules, {"pycolmap": fake_pycolmap}):
+                reconstruct(
+                    dataset,
+                    overlap=9,
+                    camera_model="OPENCV",
+                    num_threads=6,
+                    reuse_matches=True,
+                    ba_global_frames_ratio=1.3,
+                    ba_global_points_ratio=1.4,
+                    ba_global_max_refinements=2,
+                    ba_global_max_num_iterations=40,
+                    snapshot_frames_freq=250,
+                    resume_model=snapshot,
+                )
+
+            self.assertEqual(
+                [name for name, _ in calls],
+                ["incremental_mapping"],
+            )
+            self.assertEqual(calls[0][1]["input_path"], str(snapshot))
+            mapping_options = calls[0][1]["options"]
+            self.assertEqual(mapping_options.ba_global_frames_ratio, 1.3)
+            self.assertEqual(mapping_options.ba_global_points_ratio, 1.4)
+            self.assertEqual(mapping_options.ba_global_max_refinements, 2)
+            self.assertEqual(mapping_options.ba_global_max_num_iterations, 40)
+            self.assertEqual(mapping_options.snapshot_frames_freq, 250)
+            self.assertEqual(
+                mapping_options.snapshot_path,
+                str(dataset / "snapshots"),
+            )
+            self.assertTrue((dataset / "snapshots").is_dir())
+
+            stats = json.loads(
+                (dataset / "reconstruction_stats.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertTrue(stats["reused_matches"])
+            self.assertEqual(stats["resumed_from_model"], str(snapshot))
+            self.assertEqual(stats["snapshot_frames_freq"], 250)
+            self.assertEqual(
+                stats["mapper"],
+                {
+                    "init_min_tri_angle": 16.0,
+                    "ba_global_frames_ratio": 1.3,
+                    "ba_global_points_ratio": 1.4,
+                    "ba_global_max_refinements": 2,
+                    "ba_global_max_num_iterations": 40,
+                },
+            )
+            self.assertEqual(stats["status"], "passed")
 
     def test_video_set_source_registration_gate_records_pass_and_fail(
         self,
@@ -599,6 +963,40 @@ class OrchestrationTests(unittest.TestCase):
                     overlap=9,
                     camera_model="SIMPLE_RADIAL",
                     min_registration_ratio=0.0,
+                )
+
+    def test_rejects_invalid_quality_options_before_importing_pycolmap(self) -> None:
+        cases = (
+            ("vocab-tree-num-images", {"vocab_tree_num_images": 0}),
+            ("feature-max-image-size", {"feature_max_image_size": 0}),
+            ("feature-max-num-features", {"feature_max_num_features": -1}),
+            ("init-min-tri-angle", {"init_min_tri_angle": float("nan")}),
+            ("init-min-tri-angle", {"init_min_tri_angle": 181.0}),
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            dataset = Path(temporary)
+            for message, options in cases:
+                with self.subTest(message=message, options=options):
+                    with (
+                        patch.dict(sys.modules, {"pycolmap": None}),
+                        self.assertRaisesRegex(ValueError, message),
+                    ):
+                        reconstruct(
+                            dataset,
+                            overlap=9,
+                            camera_model="SIMPLE_RADIAL",
+                            **options,
+                        )
+
+            with (
+                patch.dict(sys.modules, {"pycolmap": None}),
+                self.assertRaisesRegex(FileNotFoundError, "Vocabulary-tree"),
+            ):
+                reconstruct(
+                    dataset,
+                    overlap=9,
+                    camera_model="SIMPLE_RADIAL",
+                    vocab_tree=dataset / "missing-tree.bin",
                 )
 
 
