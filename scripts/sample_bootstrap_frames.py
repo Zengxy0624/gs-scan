@@ -1,5 +1,20 @@
 #!/usr/bin/env python3
-"""Extract midpoint bootstrap candidate frames from a merged video-set dataset."""
+"""Extract bootstrap candidate frames from a merged video-set dataset.
+
+Three selection modes, combinable and deduplicated against each other and
+against images already present in the base dataset (by output name):
+
+- --all-frames-for-source PREFIX: every consecutive-pair midpoint of the
+  source's selected base frames.
+- --around-csv CSV --worst N: the midpoints neighboring the N worst-psnr
+  parseable base-frame rows of a per-image metrics CSV; rows named like
+  prior-round candidates (<prefix>m<index>.jpg) are skipped and counted.
+- --dense-range PREFIX:START:END: every source-video frame index in
+  [START, END] inclusive that is not already among the source's
+  selected_indices.
+
+At least one selection option must be given.
+"""
 
 from __future__ import annotations
 
@@ -94,7 +109,28 @@ def _parse_sample_name(name: str) -> tuple[str, int]:
     return match.group("prefix"), int(match.group("position"))
 
 
-def _worst_csv_rows(around_csv: Path, worst: int) -> list[dict[str, str]]:
+def _parse_dense_range(argument: str) -> tuple[str, int, int]:
+    """Parse one --dense-range PREFIX:START:END argument."""
+    parts = argument.split(":")
+    if len(parts) != 3:
+        raise ValueError(
+            f"--dense-range must be PREFIX:START:END: {argument!r}"
+        )
+    prefix, start_text, end_text = parts
+    try:
+        start = int(start_text)
+        end = int(end_text)
+    except ValueError:
+        raise ValueError(
+            f"--dense-range START and END must be integers: {argument!r}"
+        ) from None
+    return prefix, start, end
+
+
+def _worst_csv_rows(
+    around_csv: Path,
+    worst: int,
+) -> tuple[list[dict[str, str]], int]:
     with around_csv.open(encoding="utf-8", newline="") as handle:
         reader = csv.DictReader(handle)
         columns = reader.fieldnames or []
@@ -107,6 +143,23 @@ def _worst_csv_rows(around_csv: Path, worst: int) -> list[dict[str, str]]:
         rows = list(reader)
     if not rows:
         raise ValueError(f"Metrics CSV has no data rows: {around_csv}")
+
+    # Rows whose name is not a sampled base frame are prior-round bootstrap
+    # candidates (<prefix>m<index>.jpg); skip them before ranking so --worst
+    # counts only parseable base-frame rows.
+    parseable: list[dict[str, str]] = []
+    skipped_unparseable = 0
+    for row in rows:
+        name = row.get("name")
+        if isinstance(name, str) and _SAMPLE_NAME_PATTERN.fullmatch(name):
+            parseable.append(row)
+        else:
+            skipped_unparseable += 1
+    if not parseable:
+        raise ValueError(
+            f"Metrics CSV has no rows naming sampled base frames "
+            f"(<prefix_><position %06d>.jpg): {around_csv}"
+        )
 
     def row_psnr(row: dict[str, str]) -> float:
         try:
@@ -123,8 +176,8 @@ def _worst_csv_rows(around_csv: Path, worst: int) -> list[dict[str, str]]:
             )
         return value
 
-    rows.sort(key=row_psnr)
-    return rows[:worst]
+    parseable.sort(key=row_psnr)
+    return parseable[:worst], skipped_unparseable
 
 
 def _select_candidates(
@@ -132,8 +185,10 @@ def _select_candidates(
     all_frames_for_sources: Sequence[str],
     around_csv: Path | None,
     worst: int | None,
-) -> set[tuple[str, int]]:
+    dense_ranges: Sequence[tuple[str, int, int]],
+) -> tuple[set[tuple[str, int]], int]:
     selections: set[tuple[str, int]] = set()
+    skipped_unparseable_csv_rows = 0
 
     for prefix in all_frames_for_sources:
         record = sources.get(prefix)
@@ -149,7 +204,11 @@ def _select_candidates(
 
     if around_csv is not None:
         assert worst is not None
-        for row in _worst_csv_rows(around_csv, worst):
+        worst_rows, skipped_unparseable_csv_rows = _worst_csv_rows(
+            around_csv,
+            worst,
+        )
+        for row in worst_rows:
             prefix, position = _parse_sample_name(row["name"])
             record = sources.get(prefix)
             if record is None:
@@ -172,7 +231,31 @@ def _select_candidates(
                 if midpoint != first and midpoint != second:
                     selections.add((prefix, midpoint))
 
-    return selections
+    for prefix, start, end in dense_ranges:
+        record = sources.get(prefix)
+        if record is None:
+            raise ValueError(
+                f"--dense-range prefix {prefix!r} is not in the base "
+                f"dataset; known prefixes: {', '.join(sorted(sources))}"
+            )
+        total_frames = record.get("total_source_frames")
+        if not isinstance(total_frames, int) or total_frames <= 0:
+            raise ValueError(
+                f"Source {prefix} has no valid total_source_frames"
+            )
+        if not 0 <= start <= end < total_frames:
+            raise ValueError(
+                f"--dense-range {prefix}:{start}:{end} must satisfy "
+                f"0 <= START <= END < {total_frames} source frames"
+            )
+        selected = record["selected_indices"]
+        assert isinstance(selected, list)
+        used_indices = set(selected)
+        for index in range(start, end + 1):
+            if index not in used_indices:
+                selections.add((prefix, index))
+
+    return selections, skipped_unparseable_csv_rows
 
 
 def _extract_wanted_frames(
@@ -223,9 +306,10 @@ def sample_bootstrap_frames(
     all_frames_for_sources: Sequence[str] = (),
     around_csv: Path | None = None,
     worst: int | None = None,
+    dense_ranges: Sequence[str] = (),
     jpeg_quality: int | None = None,
 ) -> Path:
-    """Extract deduplicated midpoint candidate frames next to the worst views."""
+    """Extract deduplicated bootstrap candidate frames from source videos."""
     base = base_dataset.expanduser().resolve()
     if not base.is_dir():
         raise FileNotFoundError(f"Base dataset not found: {base}")
@@ -246,10 +330,14 @@ def sample_bootstrap_frames(
     if output == base or output.is_relative_to(base):
         raise ValueError("Output directory must not be inside the base dataset")
 
-    if not all_frames_for_sources and around_csv is None:
+    if not all_frames_for_sources and around_csv is None and not dense_ranges:
         raise ValueError(
-            "Select candidates with --all-frames-for-source and/or --around-csv"
+            "Select candidates with --all-frames-for-source, --around-csv, "
+            "and/or --dense-range"
         )
+    parsed_dense_ranges = [
+        _parse_dense_range(argument) for argument in dense_ranges
+    ]
     if (around_csv is None) != (worst is None):
         raise ValueError("--around-csv and --worst must be used together")
     if worst is not None and worst < 1:
@@ -268,11 +356,12 @@ def sample_bootstrap_frames(
         raise ValueError("--jpeg-quality must be between 1 and 100")
 
     sources = _sources_by_prefix(metadata, base)
-    selections = _select_candidates(
+    selections, skipped_unparseable_csv_rows = _select_candidates(
         sources,
         all_frames_for_sources,
         around_csv,
         worst,
+        parsed_dense_ranges,
     )
 
     base_images = base / "images"
@@ -289,7 +378,7 @@ def sample_bootstrap_frames(
             candidates.append((prefix, index))
     if not candidates:
         raise ValueError(
-            f"No bootstrap candidates remain: {len(selections)} midpoints "
+            f"No bootstrap candidates remain: {len(selections)} frames "
             f"selected, {skipped_name_collisions} skipped as name collisions"
         )
 
@@ -346,6 +435,11 @@ def sample_bootstrap_frames(
                 "all_frames_for_sources": list(all_frames_for_sources),
                 "around_csv": str(around_csv) if around_csv is not None else None,
                 "worst": worst,
+                "dense_ranges": [
+                    {"image_prefix": prefix, "start": start, "end": end}
+                    for prefix, start, end in parsed_dense_ranges
+                ],
+                "skipped_unparseable_csv_rows": skipped_unparseable_csv_rows,
             },
             "candidates": candidate_records,
             "per_source_counts": per_source_counts,
@@ -412,6 +506,17 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--dense-range",
+        action="append",
+        default=[],
+        metavar="PREFIX:START:END",
+        help=(
+            "Select every source-video frame index in [START, END] inclusive "
+            "for the source whose image_prefix equals PREFIX, excluding "
+            "indices already in its selected_indices. Repeatable."
+        ),
+    )
+    parser.add_argument(
         "--jpeg-quality",
         type=int,
         help=(
@@ -431,6 +536,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             args.all_frames_for_source,
             args.around_csv,
             args.worst,
+            args.dense_range,
             args.jpeg_quality,
         )
     except (OSError, RuntimeError, ValueError) as error:

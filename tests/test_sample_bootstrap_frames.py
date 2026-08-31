@@ -219,6 +219,8 @@ class SampleBootstrapFramesTests(unittest.TestCase):
                     "all_frames_for_sources": ["00_vid_a_"],
                     "around_csv": None,
                     "worst": None,
+                    "dense_ranges": [],
+                    "skipped_unparseable_csv_rows": 0,
                 },
             )
             self.assertEqual(
@@ -284,7 +286,193 @@ class SampleBootstrapFramesTests(unittest.TestCase):
                     "all_frames_for_sources": [],
                     "around_csv": str(metrics.resolve()),
                     "worst": 3,
+                    "dense_ranges": [],
+                    "skipped_unparseable_csv_rows": 0,
                 },
+            )
+
+    def test_dense_range_selects_unused_indices(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            base = self.make_base_dataset(root, {"vid_a": [0, 10, 20, 30]})
+            output = root / "candidates"
+
+            sample_bootstrap_frames(
+                base,
+                output,
+                dense_ranges=["00_vid_a_:8:12"],
+            )
+
+            # Index 10 is already a selected base frame and is excluded.
+            expected = {
+                "00_vid_a_m000008.jpg": 8,
+                "00_vid_a_m000009.jpg": 9,
+                "00_vid_a_m000011.jpg": 11,
+                "00_vid_a_m000012.jpg": 12,
+            }
+            self.assertEqual(
+                sorted(path.name for path in (output / "images").iterdir()),
+                sorted(expected),
+            )
+            for name, source_index in expected.items():
+                self.assert_frame_content(
+                    output / "images" / name,
+                    source_index,
+                )
+
+            metadata = json.loads(
+                (output / "metadata.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(metadata["num_candidates"], 4)
+            self.assertEqual(metadata["per_source_counts"], {"00_vid_a_": 4})
+            self.assertEqual(
+                metadata["selection"],
+                {
+                    "all_frames_for_sources": [],
+                    "around_csv": None,
+                    "worst": None,
+                    "dense_ranges": [
+                        {
+                            "image_prefix": "00_vid_a_",
+                            "start": 8,
+                            "end": 12,
+                        }
+                    ],
+                    "skipped_unparseable_csv_rows": 0,
+                },
+            )
+
+    def test_dense_range_dedupes_prior_round_name_collisions(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            base = self.make_base_dataset(root, {"vid_a": [0, 10, 20, 30]})
+            # Simulate a frame mined in an earlier bootstrap round that was
+            # merged into the base dataset under the m-frame name.
+            collision = base / "images" / "00_vid_a_m000009.jpg"
+            collision.write_bytes(b"prior-round")
+            output = root / "candidates"
+
+            sample_bootstrap_frames(
+                base,
+                output,
+                dense_ranges=["00_vid_a_:8:10"],
+            )
+
+            self.assertEqual(
+                sorted(path.name for path in (output / "images").iterdir()),
+                ["00_vid_a_m000008.jpg"],
+            )
+            metadata = json.loads(
+                (output / "metadata.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(metadata["num_candidates"], 1)
+            self.assertEqual(metadata["skipped_name_collisions"], 1)
+            self.assertEqual(collision.read_bytes(), b"prior-round")
+
+    def test_dense_range_overlapping_midpoints_dedupes(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            base = self.make_base_dataset(root, {"vid_a": [0, 10, 20, 30]})
+            output = root / "candidates"
+
+            sample_bootstrap_frames(
+                base,
+                output,
+                all_frames_for_sources=["00_vid_a_"],
+                dense_ranges=["00_vid_a_:4:6"],
+            )
+
+            # Midpoints are 5, 15, 25; the dense range adds 4, 5, 6, and
+            # the shared index 5 is selected only once.
+            self.assertEqual(
+                sorted(path.name for path in (output / "images").iterdir()),
+                [
+                    "00_vid_a_m000004.jpg",
+                    "00_vid_a_m000005.jpg",
+                    "00_vid_a_m000006.jpg",
+                    "00_vid_a_m000015.jpg",
+                    "00_vid_a_m000025.jpg",
+                ],
+            )
+            metadata = json.loads(
+                (output / "metadata.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(metadata["num_candidates"], 5)
+            self.assertEqual(metadata["skipped_name_collisions"], 0)
+
+    def test_dense_range_validation_errors(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            base = self.make_base_dataset(root, {"vid_a": [0, 10, 20]})
+            cases = (
+                ("99_missing_:0:5", "99_missing_"),
+                ("00_vid_a_:6:5", "00_vid_a_:6:5"),
+                (f"00_vid_a_:5:{FRAME_COUNT}", f"END < {FRAME_COUNT}"),
+                ("00_vid_a_:-1:5", "00_vid_a_:-1:5"),
+                ("00_vid_a_:5", "'00_vid_a_:5'"),
+                ("00_vid_a_:a:b", "'00_vid_a_:a:b'"),
+            )
+
+            for index, (argument, pattern) in enumerate(cases):
+                output = root / f"candidates-{index}"
+                with (
+                    self.subTest(argument=argument),
+                    self.assertRaisesRegex(ValueError, pattern),
+                ):
+                    sample_bootstrap_frames(
+                        base,
+                        output,
+                        dense_ranges=[argument],
+                    )
+                self.assertFalse(output.exists())
+
+    def test_around_csv_skips_prior_round_candidate_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            base = self.make_base_dataset(
+                root,
+                {"vid_a": [0, 10, 20, 30], "vid_b": [0, 10, 20, 30]},
+            )
+            # The prior-round candidate row has the worst psnr but must not
+            # count toward --worst 2: both base rows below it still qualify.
+            metrics = self.write_metrics_csv(
+                root / "metrics.csv",
+                [
+                    ("00_vid_a_m000005.jpg", 1.0),
+                    ("00_vid_a_000001.jpg", 8.0),
+                    ("00_vid_a_000002.jpg", 9.0),
+                    ("01_vid_b_000001.jpg", 40.0),
+                ],
+            )
+            output = root / "candidates"
+
+            sample_bootstrap_frames(
+                base,
+                output,
+                around_csv=metrics,
+                worst=2,
+            )
+
+            # Position 1 contributes midpoints 5 and 15; position 2 (only
+            # reached because the m-frame row was skipped, not counted)
+            # contributes 15 and 25.
+            self.assertEqual(
+                sorted(path.name for path in (output / "images").iterdir()),
+                [
+                    "00_vid_a_m000005.jpg",
+                    "00_vid_a_m000015.jpg",
+                    "00_vid_a_m000025.jpg",
+                ],
+            )
+            metadata = json.loads(
+                (output / "metadata.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(metadata["num_candidates"], 3)
+            self.assertEqual(metadata["per_source_counts"], {"00_vid_a_": 3})
+            self.assertEqual(metadata["selection"]["worst"], 2)
+            self.assertEqual(
+                metadata["selection"]["skipped_unparseable_csv_rows"],
+                1,
             )
 
     def test_no_room_midpoints_are_skipped(self) -> None:
@@ -469,6 +657,25 @@ class SampleBootstrapFramesTests(unittest.TestCase):
         self.assertEqual(args.around_csv, Path("metrics.csv"))
         self.assertEqual(args.worst, 24)
         self.assertIsNone(args.jpeg_quality)
+        self.assertEqual(args.dense_range, [])
+
+    def test_cli_parser_collects_repeated_dense_ranges(self) -> None:
+        args = build_parser().parse_args(
+            [
+                "base",
+                "candidates",
+                "--dense-range",
+                "00_a001_08071507_c004_:6270:6430",
+                "--dense-range",
+                "01_vid_b_:0:5",
+            ]
+        )
+
+        self.assertEqual(
+            args.dense_range,
+            ["00_a001_08071507_c004_:6270:6430", "01_vid_b_:0:5"],
+        )
+        self.assertEqual(args.all_frames_for_source, [])
 
 
 if __name__ == "__main__":

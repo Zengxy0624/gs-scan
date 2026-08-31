@@ -20,6 +20,8 @@ the shared-identical-frames method: intersect the two runs' per-image CSVs
 | `merged_gpu_r1` | 9,572 | 9,556 | 7,030,921 | Bootstrap round 1: base + 1,560 blur-gated midpoint candidates, all registered (100%), reproj improved to 1.372 px |
 | `merged_gpu_r1_sharp050a20` | 8,075 | 8,075 | 6,399,706 | r1 minus the 1,497 aggressive-cut base frames; candidates kept. exp11's data |
 | `boot_r1_candidates` | 1,560 | — | — | Round-1 candidates (sampled 1,705 midpoints from 5 weak videos + worst-200 neighborhoods; 145 blur-rejected) |
+| `merged_gpu_r2` | 10,185 | 10,168 | 7,195,356 | Bootstrap round 2: r1 + 613 candidates (dense 60fps door windows, c017 midpoints, exp11 worst-150 neighborhoods), 612/613 registered |
+| `merged_gpu_r2_sharp050a20` | 8,688 | 8,687 | 6,576,977 | r2 minus aggressive-cut base frames; both candidate rounds protected. exp12's data |
 
 Blur filter: variance-of-Laplacian per frame; `ratio` = raw / rolling median of
 ±10 same-video neighbors. Lesson: the ratio misses blurry *segments* (whole
@@ -89,8 +91,8 @@ which predate it. Common recipe since exp4b: `mcmc --strategy.cap-max 6500000
       shareable WebGL SfM explorer artifact; splat webviews live in the
       user's SuperSplat scenes repo (WenzhouDing/3DGS-Health-Scenes, PLY→SOG
       — feed it the `_pruned005.ply` exports)
-- [ ] Round 2 (decision-gated): dense 60fps sampling of the two c004 door
-      windows (~300 frames) → register into exp11's dataset → retrain
+- [x] Round 2 registered (612/613; door windows dense + c017 + exp11 worst
+      neighborhoods, aggressive blur gate) → exp12 next
 - [ ] Ceiling capture pass (when filming is possible)
 - [ ] Reserve lever: `--steps-scaler 8` (240k steps) on the final dataset
 - [ ] VR export (`exp4b .../point_cloud_119999_vr500k.ply`, 28 MB) render-check
