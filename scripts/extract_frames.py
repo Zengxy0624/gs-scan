@@ -1,19 +1,43 @@
-"""Uniformly sample a video into the images/ layout expected by COLMAP."""
+"""Uniformly sample a video into the images/ layout expected by COLMAP.
+
+With ``--sharpness-window SECONDS`` every uniformly spaced anchor frame is
+checked against its neighbors within +/-SECONDS (variance of the Laplacian of
+the grayscale frame). An anchor that is blurry relative to the sharpest frame
+in its window (below ``--sharpness-keep-ratio`` times that maximum) is swapped
+for that frame, so motion blur is handled at extraction time instead of being
+filtered out later, while anchors that are already sharp keep their uniform
+timing. Selections stay strictly increasing and unique, so the dataset still
+holds exactly one image per anchor. The video is decoded twice in that mode: once
+to score every frame, once to write the winners. Two CSVs are written beside
+``metadata.json``: ``sharpness_scores.csv`` (selected frames; ``name``,
+``raw``, ``ratio_local`` columns compatible with filter_sharp_dataset.py) and
+``sharpness_all_frames.csv`` (every source frame).
+"""
 
 from __future__ import annotations
 
 import argparse
+import csv
 import hashlib
 import json
 import math
 import re
 import shutil
+import statistics
 import sys
 import tempfile
+import time
 import uuid
+from collections import deque
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Sequence
+
+
+DEFAULT_SHARPNESS_WORKERS = 8
+DEFAULT_SHARPNESS_KEEP_RATIO = 0.8
+SHARPNESS_RATIO_NEIGHBORS = 10
 
 
 def _sha256(path: Path) -> str:
@@ -45,6 +69,17 @@ class VideoSample:
     source_frame_height: int
     output_frame_width: int
     output_frame_height: int
+    sharpness_window_seconds: float = 0.0
+    sharpness_window_frames: int = 0
+    sharpness_keep_ratio: float = 0.0
+    anchor_indices: list[int] | None = None
+    anchor_sharpness: list[float] | None = None
+    selected_sharpness: list[float] | None = None
+
+
+def _sample_metadata(sample: VideoSample) -> dict[str, object]:
+    """Serialize a sample, omitting fields unused by this extraction mode."""
+    return {key: value for key, value in asdict(sample).items() if value is not None}
 
 
 def select_frame_indices(
@@ -73,20 +108,70 @@ def select_frame_indices(
     return [round(position * last / (count - 1)) for position in range(count)]
 
 
-def extract_frames(
-    video_path: Path,
-    images_dir: Path,
-    sample_fps: float,
-    max_frames: int,
-    jpeg_quality: int,
-) -> VideoSample:
-    """Decode the video once and save all uniformly selected frames."""
+def select_sharp_indices(
+    anchors: Sequence[int],
+    sharpness: Sequence[float],
+    window_frames: int,
+    keep_ratio: float = DEFAULT_SHARPNESS_KEEP_RATIO,
+) -> list[int]:
+    """Swap blurry anchors for the sharpest frame within ``window_frames``.
+
+    An anchor is kept when it is still selectable and its sharpness is at
+    least ``keep_ratio`` times the best sharpness in its window (``1`` always
+    takes the sharpest frame, ``0`` never replaces an anchor). Anchors are processed left to right. Each pick
+    must lie strictly after the previous pick and must leave one free frame
+    for every later anchor, so the result is strictly increasing, unique, and
+    exactly as long as ``anchors``. Ties prefer the frame closest to the
+    anchor, then the earlier frame.
+    """
+    total = len(sharpness)
+    if window_frames < 0:
+        raise ValueError("window_frames must be non-negative")
+    if not 0 <= keep_ratio <= 1:
+        raise ValueError("keep_ratio must be between 0 and 1")
+    if not anchors:
+        raise ValueError("at least one anchor is required")
+    if list(anchors) != sorted(set(anchors)):
+        raise ValueError("anchors must be strictly increasing")
+    if anchors[0] < 0 or anchors[-1] >= total:
+        raise ValueError("anchors must index into the sharpness sequence")
+
+    chosen: list[int] = []
+    previous = -1
+    count = len(anchors)
+    for position, anchor in enumerate(anchors):
+        remaining_after = count - 1 - position
+        low = max(anchor - window_frames, previous + 1)
+        high = min(anchor + window_frames, total - 1 - remaining_after)
+        if low > high:  # unreachable for valid input; guard against regressions
+            raise RuntimeError(
+                f"empty selection window for anchor {anchor}: [{low}, {high}]"
+            )
+        best = max(
+            range(low, high + 1),
+            key=lambda index: (sharpness[index], -abs(index - anchor), -index),
+        )
+        if low <= anchor <= high and sharpness[anchor] >= keep_ratio * sharpness[best]:
+            best = anchor
+        chosen.append(best)
+        previous = best
+    return chosen
+
+
+def frame_sharpness(frame: object) -> float:
+    """Variance of the Laplacian of the grayscale frame (higher = sharper)."""
+    import cv2
+
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    return float(cv2.Laplacian(gray, cv2.CV_64F).var())
+
+
+def _open_capture(video_path: Path) -> tuple[object, float, int, int, int]:
     import cv2
 
     capture = cv2.VideoCapture(str(video_path))
     if not capture.isOpened():
         raise RuntimeError(f"OpenCV could not open video: {video_path}")
-
     if hasattr(cv2, "CAP_PROP_ORIENTATION_AUTO"):
         capture.set(cv2.CAP_PROP_ORIENTATION_AUTO, 1)
 
@@ -100,8 +185,186 @@ def extract_frames(
             "The decoder did not report valid FPS metadata and at least two "
             "frames; transcode the video to H.264 MP4 and retry."
         )
+    return capture, source_fps, total_frames, source_width, source_height
 
-    selected = select_frame_indices(total_frames, source_fps, sample_fps, max_frames)
+
+def measure_frame_sharpness(
+    video_path: Path,
+    expected_total_frames: int,
+    workers: int = DEFAULT_SHARPNESS_WORKERS,
+) -> list[float]:
+    """Decode the whole video once and score every frame's sharpness."""
+    if workers < 1:
+        raise ValueError("workers must be positive")
+    capture, _, _, _, _ = _open_capture(video_path)
+    scores: list[float] = []
+    pending: deque[Future[float]] = deque()
+    started = time.monotonic()
+    try:
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            while True:
+                ok, frame = capture.read()
+                if not ok:
+                    break
+                pending.append(pool.submit(frame_sharpness, frame))
+                # Bound the decoded frames held in memory awaiting a worker.
+                while len(pending) >= 4 * workers:
+                    scores.append(pending.popleft().result())
+                if len(scores) and len(scores) % 5000 == 0:
+                    elapsed = time.monotonic() - started
+                    print(
+                        f"  scored {len(scores)} frames "
+                        f"({len(scores) / elapsed:.0f} frames/s)",
+                        flush=True,
+                    )
+            while pending:
+                scores.append(pending.popleft().result())
+    finally:
+        capture.release()
+
+    if len(scores) != expected_total_frames:
+        raise RuntimeError(
+            "Video decoding stopped early during sharpness scoring: "
+            f"expected {expected_total_frames} frames, decoded {len(scores)}."
+        )
+    return scores
+
+
+def local_sharpness_ratios(
+    raw: Sequence[float],
+    neighbors: int = SHARPNESS_RATIO_NEIGHBORS,
+) -> list[float]:
+    """raw / rolling median over +/-neighbors positions (1.0 when undefined)."""
+    ratios: list[float] = []
+    for index, value in enumerate(raw):
+        window = raw[max(0, index - neighbors) : index + neighbors + 1]
+        median = statistics.median(window)
+        ratios.append(value / median if median > 0 else 1.0)
+    return ratios
+
+
+def write_sharpness_reports(
+    directory: Path,
+    prefix: str,
+    sample: VideoSample,
+    all_frame_sharpness: Sequence[float],
+) -> tuple[Path, Path]:
+    """Write the selected-frame score CSV and the all-frames sharpness CSV."""
+    if (
+        sample.anchor_indices is None
+        or sample.anchor_sharpness is None
+        or sample.selected_sharpness is None
+    ):
+        raise ValueError("sample has no sharpness selection to report")
+    scores_path = directory / f"{prefix}sharpness_scores.csv"
+    ratios = local_sharpness_ratios(sample.selected_sharpness)
+    with scores_path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(
+            [
+                "name",
+                "raw",
+                "ratio_local",
+                "source_index",
+                "anchor_index",
+                "shift_frames",
+                "timestamp_seconds",
+                "anchor_raw",
+            ]
+        )
+        for position, selected in enumerate(sample.selected_indices):
+            anchor = sample.anchor_indices[position]
+            writer.writerow(
+                [
+                    f"{prefix}{position:06d}.jpg",
+                    f"{sample.selected_sharpness[position]:.4f}",
+                    f"{ratios[position]:.4f}",
+                    selected,
+                    anchor,
+                    selected - anchor,
+                    f"{sample.selected_timestamps_seconds[position]:.4f}",
+                    f"{sample.anchor_sharpness[position]:.4f}",
+                ]
+            )
+
+    all_path = directory / f"{prefix}sharpness_all_frames.csv"
+    anchors = set(sample.anchor_indices)
+    selected_set = set(sample.selected_indices)
+    with all_path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(
+            ["source_index", "timestamp_seconds", "raw", "is_anchor", "is_selected"]
+        )
+        for index, value in enumerate(all_frame_sharpness):
+            writer.writerow(
+                [
+                    index,
+                    f"{index / sample.source_fps:.4f}",
+                    f"{value:.4f}",
+                    int(index in anchors),
+                    int(index in selected_set),
+                ]
+            )
+    return scores_path, all_path
+
+
+def extract_frames(
+    video_path: Path,
+    images_dir: Path,
+    sample_fps: float,
+    max_frames: int,
+    jpeg_quality: int,
+    sharpness_window: float = 0.0,
+    sharpness_workers: int = DEFAULT_SHARPNESS_WORKERS,
+    sharpness_keep_ratio: float = DEFAULT_SHARPNESS_KEEP_RATIO,
+    report_dir: Path | None = None,
+    report_prefix: str = "",
+) -> VideoSample:
+    """Decode the video and save all selected frames.
+
+    With ``sharpness_window > 0`` the video is decoded twice: a scoring pass
+    over every frame, then a writing pass for the chosen frames. Reports are
+    written to ``report_dir`` (default: the parent of ``images_dir``).
+    """
+    import cv2
+
+    capture, source_fps, total_frames, source_width, source_height = _open_capture(
+        video_path
+    )
+    capture.release()
+
+    anchors = select_frame_indices(total_frames, source_fps, sample_fps, max_frames)
+    window_frames = 0
+    all_sharpness: list[float] | None = None
+    if sharpness_window > 0:
+        window_frames = int(round(sharpness_window * source_fps))
+        print(
+            f"Scoring sharpness of {total_frames} frames "
+            f"(window +/-{window_frames} frames = {sharpness_window} s)",
+            flush=True,
+        )
+        all_sharpness = measure_frame_sharpness(
+            video_path,
+            total_frames,
+            sharpness_workers,
+        )
+        selected = select_sharp_indices(
+            anchors,
+            all_sharpness,
+            window_frames,
+            sharpness_keep_ratio,
+        )
+        moved = sum(1 for a, s in zip(anchors, selected, strict=True) if a != s)
+        print(
+            f"Selected {len(selected)} frames; {moved} anchors below "
+            f"{sharpness_keep_ratio:g}x of their window maximum moved to a "
+            "sharper neighbor",
+            flush=True,
+        )
+    else:
+        selected = anchors
+
+    capture, _, _, _, _ = _open_capture(video_path)
     images_dir.mkdir(parents=True, exist_ok=False)
     selected_cursor = 0
     source_index = 0
@@ -134,17 +397,41 @@ def extract_frames(
             f"expected {len(selected)} sampled frames, wrote {selected_cursor}."
         )
 
-    return VideoSample(
+    sample = VideoSample(
         source_fps=source_fps,
         total_source_frames=total_frames,
         duration_seconds=(total_frames - 1) / source_fps,
-        selected_indices=selected,
+        selected_indices=list(selected),
         selected_timestamps_seconds=[index / source_fps for index in selected],
         source_frame_width=source_width,
         source_frame_height=source_height,
         output_frame_width=output_width,
         output_frame_height=output_height,
+        sharpness_window_seconds=float(sharpness_window),
+        sharpness_window_frames=window_frames,
+        sharpness_keep_ratio=(
+            float(sharpness_keep_ratio) if all_sharpness is not None else 0.0
+        ),
+        anchor_indices=list(anchors) if all_sharpness is not None else None,
+        anchor_sharpness=(
+            [all_sharpness[index] for index in anchors]
+            if all_sharpness is not None
+            else None
+        ),
+        selected_sharpness=(
+            [all_sharpness[index] for index in selected]
+            if all_sharpness is not None
+            else None
+        ),
     )
+    if all_sharpness is not None:
+        write_sharpness_reports(
+            report_dir if report_dir is not None else images_dir.parent,
+            report_prefix,
+            sample,
+            all_sharpness,
+        )
+    return sample
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -188,6 +475,35 @@ def build_parser() -> argparse.ArgumentParser:
         default=95,
         help="OpenCV JPEG quality from 1 to 100 (default: 95).",
     )
+    parser.add_argument(
+        "--sharpness-window",
+        type=float,
+        default=0.0,
+        help=(
+            "Replace each uniformly sampled anchor frame by the sharpest frame "
+            "within this many seconds of it (variance of Laplacian). 0 keeps "
+            "the exact uniform anchors (default: 0)."
+        ),
+    )
+    parser.add_argument(
+        "--sharpness-keep-ratio",
+        type=float,
+        default=DEFAULT_SHARPNESS_KEEP_RATIO,
+        help=(
+            "Keep an anchor whose sharpness is at least this fraction of the "
+            "sharpest frame in its window; lower anchors are replaced. 1 always "
+            "takes the sharpest frame, 0 never replaces (default: %(default)s)."
+        ),
+    )
+    parser.add_argument(
+        "--sharpness-workers",
+        type=int,
+        default=DEFAULT_SHARPNESS_WORKERS,
+        help=(
+            "Threads scoring frame sharpness while the video decodes "
+            "(default: %(default)s)."
+        ),
+    )
     return parser
 
 
@@ -197,6 +513,9 @@ def _validate_creation_request(
     sample_fps: float,
     max_frames: int,
     jpeg_quality: int,
+    sharpness_window: float = 0.0,
+    sharpness_workers: int = DEFAULT_SHARPNESS_WORKERS,
+    sharpness_keep_ratio: float = DEFAULT_SHARPNESS_KEEP_RATIO,
 ) -> None:
     if not videos:
         raise ValueError("at least one source video is required")
@@ -213,6 +532,12 @@ def _validate_creation_request(
         raise ValueError("--max-frames must be at least 2")
     if not 1 <= jpeg_quality <= 100:
         raise ValueError("--jpeg-quality must be between 1 and 100")
+    if not math.isfinite(sharpness_window) or sharpness_window < 0:
+        raise ValueError("--sharpness-window must be zero or positive")
+    if sharpness_workers < 1:
+        raise ValueError("--sharpness-workers must be positive")
+    if not (math.isfinite(sharpness_keep_ratio) and 0 <= sharpness_keep_ratio <= 1):
+        raise ValueError("--sharpness-keep-ratio must be between 0 and 1")
 
 
 def _source_prefix(index: int, video: Path) -> str:
@@ -226,6 +551,9 @@ def create_dataset(
     sample_fps: float,
     max_frames: int,
     jpeg_quality: int,
+    sharpness_window: float = 0.0,
+    sharpness_workers: int = DEFAULT_SHARPNESS_WORKERS,
+    sharpness_keep_ratio: float = DEFAULT_SHARPNESS_KEEP_RATIO,
 ) -> Path:
     video = video.expanduser().resolve()
     dataset = dataset.expanduser().resolve()
@@ -235,6 +563,9 @@ def create_dataset(
         sample_fps,
         max_frames,
         jpeg_quality,
+        sharpness_window,
+        sharpness_workers,
+        sharpness_keep_ratio,
     )
 
     dataset.parent.mkdir(parents=True, exist_ok=True)
@@ -251,6 +582,10 @@ def create_dataset(
             sample_fps,
             max_frames,
             jpeg_quality,
+            sharpness_window=sharpness_window,
+            sharpness_workers=sharpness_workers,
+            sharpness_keep_ratio=sharpness_keep_ratio,
+            report_dir=temporary,
         )
         images_sha256 = _tree_sha256(temporary / "images")
         metadata = {
@@ -264,7 +599,7 @@ def create_dataset(
             "sample_fps": sample_fps,
             "max_frames": max_frames,
             "jpeg_quality": jpeg_quality,
-            **asdict(sample),
+            **_sample_metadata(sample),
         }
         (temporary / "metadata.json").write_text(
             json.dumps(metadata, indent=2) + "\n",
@@ -286,6 +621,9 @@ def create_video_set_dataset(
     sample_fps: float,
     max_frames: int,
     jpeg_quality: int,
+    sharpness_window: float = 0.0,
+    sharpness_workers: int = DEFAULT_SHARPNESS_WORKERS,
+    sharpness_keep_ratio: float = DEFAULT_SHARPNESS_KEEP_RATIO,
 ) -> Path:
     """Sample an ordered set of videos into one atomic COLMAP dataset."""
     resolved_videos = [video.expanduser().resolve() for video in videos]
@@ -298,6 +636,9 @@ def create_video_set_dataset(
         sample_fps,
         max_frames,
         jpeg_quality,
+        sharpness_window,
+        sharpness_workers,
+        sharpness_keep_ratio,
     )
 
     source_identities = []
@@ -327,6 +668,7 @@ def create_video_set_dataset(
         for index, (video, identity) in enumerate(
             zip(resolved_videos, source_identities, strict=True)
         ):
+            image_prefix = _source_prefix(index, video)
             staging_dir = temporary / f".source-{index:02d}"
             sample = extract_frames(
                 video,
@@ -334,6 +676,11 @@ def create_video_set_dataset(
                 sample_fps,
                 max_frames,
                 jpeg_quality,
+                sharpness_window=sharpness_window,
+                sharpness_workers=sharpness_workers,
+                sharpness_keep_ratio=sharpness_keep_ratio,
+                report_dir=temporary,
+                report_prefix=image_prefix,
             )
             dimensions = (
                 sample.output_frame_width,
@@ -349,7 +696,6 @@ def create_video_set_dataset(
                     f"got {dimensions[0]}x{dimensions[1]} for {video}"
                 )
 
-            image_prefix = _source_prefix(index, video)
             for frame_index in range(len(sample.selected_indices)):
                 source_image = staging_dir / f"{frame_index:06d}.jpg"
                 target_image = images_dir / f"{image_prefix}{frame_index:06d}.jpg"
@@ -362,7 +708,7 @@ def create_video_set_dataset(
                 {
                     **identity,
                     "image_prefix": image_prefix,
-                    **asdict(sample),
+                    **_sample_metadata(sample),
                 }
             )
 
@@ -380,6 +726,10 @@ def create_video_set_dataset(
             "sample_fps": sample_fps,
             "max_frames": max_frames,
             "jpeg_quality": jpeg_quality,
+            "sharpness_window_seconds": float(sharpness_window),
+            "sharpness_keep_ratio": (
+                float(sharpness_keep_ratio) if sharpness_window > 0 else 0.0
+            ),
         }
         (temporary / "metadata.json").write_text(
             json.dumps(metadata, indent=2) + "\n",
@@ -405,6 +755,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 args.sample_fps,
                 args.max_frames,
                 args.jpeg_quality,
+                sharpness_window=args.sharpness_window,
+                sharpness_workers=args.sharpness_workers,
+                sharpness_keep_ratio=args.sharpness_keep_ratio,
             )
         else:
             create_dataset(
@@ -413,6 +766,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 args.sample_fps,
                 args.max_frames,
                 args.jpeg_quality,
+                sharpness_window=args.sharpness_window,
+                sharpness_workers=args.sharpness_workers,
+                sharpness_keep_ratio=args.sharpness_keep_ratio,
             )
     except (OSError, RuntimeError, ValueError) as error:
         print(f"error: {error}", file=sys.stderr)

@@ -27,6 +27,13 @@ Deviation from upstream eval: side-by-side render PNGs are written for every
 Usage is identical to simple_trainer.py, e.g.:
   python scripts/train_experiment.py mcmc --strategy.cap-max 6500000 ...
   python scripts/train_experiment.py default --strategy.absgrad ...
+
+Checkpoint modes (pass the same recipe flags as the training run):
+  --ckpt CKPT             render ``videos/traj_<step>.mp4`` from a checkpoint
+                          (restores the ``--app-opt`` module too, unlike upstream)
+  --ckpt CKPT --view-only serve the interactive viser viewer on ``--port``
+                          (default 8080) from a checkpoint and wait; no eval,
+                          no trajectory render. Forward the port over SSH.
 """
 
 from __future__ import annotations
@@ -37,10 +44,11 @@ import math
 import os
 import sys
 import time
+from dataclasses import dataclass
 from collections import defaultdict
 from pathlib import Path
 from types import ModuleType
-from typing import Sequence
+from typing import Callable, Sequence
 
 _EXAMPLES = Path(__file__).resolve().parents[1] / "third-party" / "gsplat" / "examples"
 sys.path.insert(0, str(_EXAMPLES))
@@ -298,12 +306,21 @@ def _maybe_activate_wandb(
     return wandb
 
 
-def _render_traj_from_checkpoint(runner: Runner, cfg: Config) -> None:
-    """Load a training checkpoint and render only the trajectory video.
+@dataclass
+class ExperimentConfig(Config):
+    """Upstream Config plus the checkpoint viewer switch."""
+
+    # With --ckpt: start the viser viewer from the checkpoint and wait instead
+    # of rendering the trajectory video. Requires the viewer to be enabled.
+    view_only: bool = False
+
+
+def _restore_checkpoint(runner: Runner, cfg: Config) -> int:
+    """Load splats and the ``--app-opt`` module from ``cfg.ckpt``; return step.
 
     Upstream's eval-only branch restores the splats but silently leaves an
     ``--app-opt`` appearance module randomly initialized, which garbles the
-    colors. This restores both, then renders ``videos/traj_<step>.mp4``.
+    colors. This restores both.
     """
     ckpts = [
         torch.load(file, map_location=runner.device, weights_only=True)
@@ -326,9 +343,34 @@ def _render_traj_from_checkpoint(runner: Runner, cfg: Config) -> None:
             )
         module = getattr(app_module, "module", app_module)
         module.load_state_dict(app_state)
-    step = ckpts[0]["step"]
+    return int(ckpts[0]["step"])
+
+
+def _render_traj_from_checkpoint(runner: Runner, cfg: Config) -> None:
+    """Load a training checkpoint and render only the trajectory video."""
+    step = _restore_checkpoint(runner, cfg)
     print(f"Rendering trajectory from checkpoint at step {step}")
     runner.render_traj(step=step)
+
+
+def _serve_viewer_from_checkpoint(
+    runner: Runner,
+    cfg: Config,
+    sleep: "Callable[[float], None]" = time.sleep,
+) -> None:
+    """Load a checkpoint and keep the interactive viser viewer running."""
+    if cfg.disable_viewer or getattr(runner, "viewer", None) is None:
+        raise RuntimeError("--view-only needs the viewer enabled (drop --disable-viewer)")
+    step = _restore_checkpoint(runner, cfg)
+    runner.viewer.complete()
+    print(
+        f"Viewing checkpoint at step {step}: open http://localhost:{cfg.port} "
+        "(forward the port over SSH, e.g. ssh -L "
+        f"{cfg.port}:localhost:{cfg.port} <host>). Ctrl+C to exit.",
+        flush=True,
+    )
+    while True:
+        sleep(3600)
 
 
 def main(local_rank: int, world_rank: int, world_size: int, cfg: Config) -> None:
@@ -343,7 +385,10 @@ def main(local_rank: int, world_rank: int, world_size: int, cfg: Config) -> None
     if world_rank == 0:
         _wrap_strategy_distribution_logging(runner)
     if cfg.ckpt is not None:
-        _render_traj_from_checkpoint(runner, cfg)
+        if getattr(cfg, "view_only", False):
+            _serve_viewer_from_checkpoint(runner, cfg)
+        else:
+            _render_traj_from_checkpoint(runner, cfg)
         return
     wandb_module = _maybe_activate_wandb(runner, cfg, world_rank)
     try:
@@ -357,11 +402,11 @@ if __name__ == "__main__":
     configs = {
         "default": (
             "Densification heuristics from the original paper (instrumented).",
-            Config(strategy=DefaultStrategy(verbose=True)),
+            ExperimentConfig(strategy=DefaultStrategy(verbose=True)),
         ),
         "mcmc": (
             "MCMC strategy with a fixed Gaussian budget (instrumented).",
-            Config(
+            ExperimentConfig(
                 init_opa=0.5,
                 init_scale=0.1,
                 opacity_reg=0.01,

@@ -40,8 +40,8 @@ Both wrong flavors produced real multi-hour crashes on this project's
   matching) against the real feature database with zero warnings and zero
   crashes.
 
-The pipeline scripts (`scripts/run_ambulance_colmap.sh`,
-`scripts/run_single_video_gs.sh`) apply, for vocab-tree reconstructions:
+The COLMAP wrapper (`scripts/run_object_colmap.sh`) applies, for pip-wheel
+interpreters (the cuDSS build links a threaded BLAS and skips it):
 
 ```
 LD_PRELOAD=third-party/openblas-threaded/libopenblas-pthread.so.0
@@ -74,4 +74,16 @@ with `dpkg -x`, and copy the real files (dereference symlinks) here.
 
 This shim can be retired once a pycolmap wheel ships a thread-safe BLAS —
 check with `ctypes` that `openblas_get_num_procs()` on `pycolmap/_core*.so`
-reports more than 1.
+reports more than 1. Checked 2026-09-01: `pycolmap-cuda12` 4.2.0 still
+reports 1 and exports `sgemm_`/`dgemm_` via `R_X86_64_JUMP_SLOT`, so the shim
+interposes it too.
+
+## Thread budget (third crash mode)
+
+The concurrent-caller count is COLMAP worker threads **plus** OpenMP workers.
+With `--num-threads -1` (256 on shenlong-gpu-02) and `OMP_NUM_THREADS=64`,
+vocabulary-tree indexing printed "precompiled NUM_THREADS exceeded, adding
+auxiliary array" and segfaulted in `sgemm_incopy_COOPERLAKE` within seconds.
+Keep both at 32 (`scripts/run_object_colmap.sh` enforces this whenever
+the shim is on); the mapping stage may then raise the shim to 48 threads
+because bundle adjustment has a single BLAS caller.

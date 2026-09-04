@@ -9,7 +9,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from scripts.filter_sharp_dataset import (
+from archive.scripts.filter_sharp_dataset import (
     _removal_set,
     build_parser,
     filter_sharp_dataset,

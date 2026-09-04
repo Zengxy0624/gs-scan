@@ -10,7 +10,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from scripts.register_new_frames import (
+from archive.scripts.register_new_frames import (
     MATCHING_OMP_THREADS,
     OPENBLAS_SHIM_BASENAME,
     build_parser,

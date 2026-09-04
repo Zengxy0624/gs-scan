@@ -9,7 +9,7 @@ written to. A protected-names list (e.g. bootstrap candidates that are not in
 the score file) is always kept.
 
 Example:
-  python scripts/filter_sharp_dataset.py \
+  python archive/scripts/filter_sharp_dataset.py \
       work/ambulance/merged_gpu_r1 work/ambulance/merged_gpu_r1_sharp050a20 \
       --scores work/ambulance/merged_gpu_sharp050a20/sharpness_scores.csv \
       --ratio-threshold 0.50 --raw-floor 20 \
@@ -29,10 +29,13 @@ import tempfile
 from pathlib import Path
 from typing import Sequence
 
-try:
-    from merge_frame_datasets import _link_or_copy
-except ImportError:  # imported as scripts.filter_sharp_dataset
-    from scripts.merge_frame_datasets import _link_or_copy
+# Archived under archive/: put the repo root on sys.path so the shared
+# helpers that stayed in scripts/ resolve under direct execution too.
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from scripts.merge_frame_datasets import _link_or_copy  # noqa: E402
 
 
 MODEL_FILE_NAMES = ("cameras.bin", "images.bin", "points3D.bin")

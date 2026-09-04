@@ -1,82 +1,94 @@
 # scripts/
 
 Flat on purpose: running tmux jobs, shell history, and the test suite all
-reference these paths, so files are grouped here by role instead of moved into
-subdirectories. Every script is covered by `tests/` (same stem, `test_` prefix,
-except where noted).
+reference these paths. Every script has `--dry-run` where it launches work and
+a `tests/test_<stem>.py`. The end-to-end runbook is `docs/OBJECT_PIPELINE.md`;
+retired scripts live in `archive/` and are not listed below.
 
-## Pipeline, in execution order
+## The object pipeline (clips → frames → COLMAP → 3DGS)
 
-**1. Frames from video**
-- `extract_frames.py` — one video → `dataset/images/*.jpg` + content-hashed
-  `metadata.json` (uniform sampling, default 3 fps).
-- `sample_ambulance_frames.sh` — batch wrapper: every ambulance video → its own
-  frame cache under `work/ambulance/` (tested via `test_ambulance_scripts.py`).
-- `merge_frame_datasets.py` — hardlink-merge validated single-video caches into
-  one `video_set` dataset with per-source `NN_<video>_` name prefixes.
+- `run_object_pipeline.sh` — driver: `--project P --name N [--gpu G] CLIP…`
+  runs the three stages below (`--stages frames,colmap,train`), prints every
+  underlying command, `--ba-preset fast|production`, `--train-steps`,
+  `--tag`, pass-through `--prepare-arg/--colmap-arg`.
+- `prepare_object_frames.sh` — stage 1: per clip, blur-aware extraction →
+  residual-blur filter → EXIF capture metadata; then hardlink-merge into
+  `work/P/N`. Idempotent; `--project`/`--capture-root`/`--work-root`,
+  `--annotation`, `--sample-fps`, `--sharpness-window`, `--keep-ratio`,
+  `--drop-ratio`.
+- `run_object_colmap.sh` — stage 2: production COLMAP recipe on one merged
+  dataset (`--dataset`); auto-selects the cuDSS GPU build → CUDA wheel → CPU;
+  BLAS shim + 32-thread cap for pip wheels; explicit BA schedule; snapshots /
+  `--resume-from-snapshot` / `--reuse-matches`; per-clip registration gates;
+  lock + log under `<parent>/_logs/`.
+- `train_experiment.py` — stage 3: instrumented `simple_trainer` wrapper
+  (per-image + per-clip val CSVs, opacity/scale distributions, optional W&B
+  via `WANDB_PROJECT`). `--ckpt CKPT` re-renders the trajectory video with the
+  `--app-opt` module restored; `--ckpt CKPT --view-only [--port]` serves the
+  viser viewer from a checkpoint. Tests: `test_train_experiment_ckpt.py`,
+  `test_train_experiment_wandb.py`.
 
-**2. COLMAP reconstruction**
-- `prepare_colmap.py` — images → `database.db` + `sparse/0` via pycolmap.
-  Vocab-tree/sequential/exhaustive matching, single shared camera, BA-schedule
-  tuning, snapshots/resume, GPU BA, match reuse.
-- `run_ambulance_colmap.sh` — production wrapper: merge + reconstruct with the
-  quality recipe, OpenBLAS shim environment, locking, registration gates,
-  `--resume-from-snapshot`, `COLMAP_PYTHON` override for the GPU-BA
-  interpreter (tested via `test_ambulance_scripts.py`).
+## Stage building blocks
 
-**3. Training**
-- `train_experiment.py` — instrumented `simple_trainer` wrapper (per-image +
-  per-source val CSVs, opacity/scale distribution logging). The trainer used
-  for every experiment since exp6 — see `docs/EXPERIMENTS.md` for recipes
-  (no dedicated unit test; smoke-tested by running).
-- `train_ambulance_gs.sh` — manifest-gated batch trainer with fixed profiles
-  (tested via `test_ambulance_scripts.py`).
-- `run_single_video_gs.sh` — one-video COLMAP+GS convenience pipeline.
+- `extract_frames.py` — one video → `images/*.jpg` + content-hashed
+  `metadata.json`; `--sharpness-window S --sharpness-keep-ratio R` swaps
+  blurry anchors for the sharpest frame within ±S s; writes
+  `sharpness_scores.csv` / `sharpness_all_frames.csv`. `--additional-video`
+  builds a multi-video set directly.
+- `filter_frame_cache.py` — hardlinked copy of a cache without images whose
+  `ratio_local` < threshold (optional `--raw-floor`); renumbers, rewrites
+  metadata + CSVs, records the threshold in the recipe.
+- `annotate_frame_cache.py` — embeds the video's annotation-CSV row as EXIF in
+  every image (ISO, shutter, f-number, 35 mm-equivalent focal length → COLMAP
+  focal prior, WB, per-frame capture time, GPS, description, make/model/
+  software) and writes `image_metadata.csv`; lossless.
+- `merge_frame_datasets.py` — hardlink-merge validated single-video caches
+  into one `video_set` (`NN_<clip>_` prefixes); refuses mixed recipes; carries
+  `capture_metadata`, concatenates `image_metadata.csv`.
+- `prepare_colmap.py` — images → `database.db` + `sparse/0` via pycolmap 3.13
+  or 4.x: vocab-tree/sequential/exhaustive matching, single shared camera,
+  `--feature-gpu`, `--ba-use-gpu`, BA-schedule tuning, snapshots/resume,
+  match reuse, registration gates, `reconstruction_stats.json`.
+- `validate_dataset_cache.py` — verifies a cache or merged dataset against its
+  sources and recipe (fps, window, keep/drop ratios) and, with
+  `--require-colmap`, the recorded COLMAP configuration and model files.
 
-**4. Dataset curation**
-- `filter_sharp_dataset.py` — build a blur-filtered copy of a reconstructed
-  dataset: removed frames are deregistered from a copy of the COLMAP model
-  (no new BA); supports a protected-names list so bootstrap candidates
-  survive base-frame cuts.
+## Environment
 
-**5. Bootstrap loop (hard-example mining; see docs/EXPERIMENTS.md)**
-- `sample_bootstrap_frames.py` — extract 60fps midpoint candidates around
-  weak videos / worst-scoring frames from the source videos.
-- `register_new_frames.py` — register candidates into an existing model:
-  augmented dataset copy, extraction+matching restricted to the new images,
-  resume mapping, single-camera and registration-ratio gates. Enforces the
-  OpenBLAS launch-environment contract (fails fast with the fix).
-- `score_candidate_frames.py` — render registered candidates from a trained
-  PLY at their COLMAP poses, rank by exposure-neutralized PSNR (worst = best
-  round-2 targets).
+- `setup_gsplat.sh` — pinned gsplat environment (`third-party/gsplat/.venv`).
+- `build_gpu_colmap.sh` — source-build the CUDA + cuDSS pycolmap for GPU
+  bundle adjustment into `work/_gpu_colmap/` (micromamba + conda-forge; Ceres
+  master, COLMAP 4.2.0; phased/resumable; `--dry-run`).
 
-**Tracking & visualization**
-- `export_rerun_viz.py` — export a COLMAP sparse model (points + camera poses
-  colored by source video) to a `.rrd` file for the rerun viewer
-  (`rerun file.rrd` or drag-drop at rerun.io/viewer).
-- W&B mirroring lives inside `train_experiment.py`: set
-  `WANDB_PROJECT=ambulance-3dgs` (optionally `WANDB_MODE=offline`) and every
-  TensorBoard scalar plus eval render canvases mirror to wandb; unset = no
-  behavior change.
+## Inspection
 
-**Provenance / environment**
-- `build_run_manifest.py` — bind a training run to source/model/code identity.
-- `validate_dataset_cache.py` — verify frame caches against their metadata.
-- `setup_gsplat.sh` — pinned environment bootstrap.
-- `run_device_test.sh`, `run_record_pattern_test.sh` — earlier device/record
-  comparison batches (see `docs/device_test.md`, `docs/record_pattern_test.md`).
+- `export_rerun_viz.py` — sparse model + camera poses → `.rrd` for rerun.
 
 ## Environment contract (matching runs)
 
-Any run that performs pycolmap feature matching must be launched with the
-pthread OpenBLAS shim preloaded and thread pins set **at launch**:
+Any pycolmap *pip wheel* (CPU 3.13 or `pycolmap-cuda12`) statically links a
+serial OpenBLAS that segfaults when faiss vocabulary-tree retrieval calls it
+from many threads. Launch such runs with the vendored pthread shim:
 
 ```bash
 LD_PRELOAD=$PWD/third-party/openblas-threaded/libopenblas-pthread.so.0 \
 LD_LIBRARY_PATH=$PWD/third-party/openblas-threaded \
-OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=32 ...
+OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=32 ... --num-threads 32
 ```
 
-`run_ambulance_colmap.sh` sets this itself; `register_new_frames.py` verifies
-it and refuses to start otherwise. Rationale and crash forensics:
-`third-party/openblas-threaded/README.md`.
+Both COLMAP worker threads and OpenMP workers count against the shim's 64
+concurrent-caller limit; 256 + 64 crashed, 32 + 32 is safe.
+`run_object_colmap.sh` applies all of this itself;
+`archive/scripts/register_new_frames.py` refuses to start without it. The cuDSS
+build (`work/_gpu_colmap`) links a threaded BLAS and needs neither. Details and
+forensics: `third-party/openblas-threaded/README.md`.
+
+## Retired
+
+The ambulance-era curation and hard-example-mining tools
+(`filter_sharp_dataset.py`, `sample_bootstrap_frames.py`,
+`register_new_frames.py`, `score_candidate_frames.py`) and the standalone
+`build_run_manifest.py` moved to `archive/scripts/`, with their tests in
+`archive/tests/`. They are unmaintained and excluded from
+`unittest discover -s tests`; `archive/README.md` says what each did and what
+replaced it.

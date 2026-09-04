@@ -24,8 +24,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SHIM_DIR = PROJECT_ROOT / "third-party" / "openblas-threaded"
 SHIM = SHIM_DIR / "libopenblas-pthread.so.0"
 SCRIPTS = (
-    PROJECT_ROOT / "scripts" / "run_ambulance_colmap.sh",
-    PROJECT_ROOT / "scripts" / "run_single_video_gs.sh",
+    PROJECT_ROOT / "scripts" / "run_object_colmap.sh",
 )
 
 

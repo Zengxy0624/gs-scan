@@ -1,9 +1,16 @@
 #!/usr/bin/env python3
-"""Atomically merge existing single-video frame caches into one video set."""
+"""Atomically merge existing single-video frame caches into one video set.
+
+Per-source capture metadata (``capture_metadata``, written by
+annotate_frame_cache.py) is carried into the merged source records, and the
+sources' ``image_metadata.csv`` files, when present, are concatenated into the
+merged dataset with the prefixed image names (all sources must have one).
+"""
 
 from __future__ import annotations
 
 import argparse
+import csv
 import errno
 import hashlib
 import json
@@ -33,6 +40,18 @@ SOURCE_RECORD_FIELDS = (
     "output_frame_width",
     "output_frame_height",
 )
+# Present only for caches extracted with --sharpness-window; copied when found.
+OPTIONAL_SOURCE_RECORD_FIELDS = (
+    "sharpness_window_frames",
+    "anchor_indices",
+    "anchor_sharpness",
+    "selected_sharpness",
+    "capture_metadata",
+    "exif_embedded",
+    "removed_frame_count",
+    "removed_source_indices",
+)
+IMAGE_METADATA_FILE = "image_metadata.csv"
 
 
 def _sha256(path: Path) -> str:
@@ -142,8 +161,11 @@ def merge_frame_datasets(
         output_images.mkdir()
         merged_digest = hashlib.sha256()
         source_records: list[dict[str, object]] = []
+        image_metadata_rows: list[dict[str, str]] = []
+        image_metadata_fields: list[str] | None = None
+        sources_with_image_metadata = 0
         total_selected_frames = 0
-        expected_recipe: tuple[float, int, int] | None = None
+        expected_recipe: tuple[float, int, int, float, float, float, float] | None = None
         expected_dimensions: tuple[int, int] | None = None
 
         for index, source_dataset in enumerate(sources):
@@ -163,6 +185,10 @@ def merge_frame_datasets(
             sample_fps = float(metadata.get("sample_fps", -1))
             max_frames = metadata.get("max_frames")
             jpeg_quality = metadata.get("jpeg_quality", 95)
+            sharpness_window = metadata.get("sharpness_window_seconds", 0.0)
+            keep_ratio = metadata.get("sharpness_keep_ratio", 0.0)
+            drop_ratio = metadata.get("sharpness_drop_ratio", 0.0)
+            drop_floor = metadata.get("sharpness_drop_raw_floor", 0.0)
             if (
                 not math.isfinite(sample_fps)
                 or sample_fps <= 0
@@ -170,9 +196,31 @@ def merge_frame_datasets(
                 or max_frames < 2
                 or not isinstance(jpeg_quality, int)
                 or not 1 <= jpeg_quality <= 100
+                or isinstance(sharpness_window, bool)
+                or not isinstance(sharpness_window, (int, float))
+                or not math.isfinite(float(sharpness_window))
+                or float(sharpness_window) < 0
+                or isinstance(keep_ratio, bool)
+                or not isinstance(keep_ratio, (int, float))
+                or not 0 <= float(keep_ratio) <= 1
+                or any(
+                    isinstance(value, bool)
+                    or not isinstance(value, (int, float))
+                    or not math.isfinite(float(value))
+                    or float(value) < 0
+                    for value in (drop_ratio, drop_floor)
+                )
             ):
                 raise ValueError(f"Invalid extraction recipe: {source_dataset}")
-            recipe = (sample_fps, max_frames, jpeg_quality)
+            recipe = (
+                sample_fps,
+                max_frames,
+                jpeg_quality,
+                float(sharpness_window),
+                float(keep_ratio),
+                float(drop_ratio),
+                float(drop_floor),
+            )
             if expected_recipe is None:
                 expected_recipe = recipe
             elif recipe != expected_recipe:
@@ -245,13 +293,68 @@ def merge_frame_datasets(
             source_records.append(
                 {
                     **{field: metadata[field] for field in SOURCE_RECORD_FIELDS},
+                    **{
+                        field: metadata[field]
+                        for field in OPTIONAL_SOURCE_RECORD_FIELDS
+                        if field in metadata
+                    },
+                    "sharpness_window_seconds": float(sharpness_window),
+                    "sharpness_keep_ratio": float(keep_ratio),
+                    "sharpness_drop_ratio": float(drop_ratio),
+                    "sharpness_drop_raw_floor": float(drop_floor),
                     "image_prefix": prefix,
                 }
             )
             total_selected_frames += len(selected_indices)
 
+            image_metadata_path = source_dataset / IMAGE_METADATA_FILE
+            if image_metadata_path.is_file():
+                sources_with_image_metadata += 1
+                with image_metadata_path.open(newline="", encoding="utf-8") as handle:
+                    reader = csv.DictReader(handle)
+                    fields = list(reader.fieldnames or [])
+                    rows = list(reader)
+                if "name" not in fields:
+                    raise ValueError(
+                        f"{IMAGE_METADATA_FILE} lacks a name column: {source_dataset}"
+                    )
+                if [row["name"] for row in rows] != expected_names:
+                    raise ValueError(
+                        f"{IMAGE_METADATA_FILE} rows do not match the frame list: "
+                        f"{source_dataset}"
+                    )
+                if image_metadata_fields is None:
+                    image_metadata_fields = ["name", "source_dataset", *[
+                        field for field in fields if field != "name"
+                    ]]
+                elif [f for f in fields if f != "name"] != image_metadata_fields[2:]:
+                    raise ValueError(
+                        f"{IMAGE_METADATA_FILE} columns differ between sources: "
+                        f"{source_dataset}"
+                    )
+                for row in rows:
+                    image_metadata_rows.append(
+                        {
+                            **row,
+                            "name": f"{prefix}{row['name']}",
+                            "source_dataset": source_dataset.name,
+                        }
+                    )
+
         if expected_recipe is None or expected_dimensions is None:
             raise RuntimeError("No frame datasets were merged")
+        if 0 < sources_with_image_metadata < len(sources):
+            raise ValueError(
+                f"Only {sources_with_image_metadata} of {len(sources)} frame caches "
+                f"have {IMAGE_METADATA_FILE}; annotate all or none"
+            )
+        if image_metadata_fields is not None:
+            with (temporary / IMAGE_METADATA_FILE).open(
+                "w", newline="", encoding="utf-8"
+            ) as handle:
+                writer = csv.DictWriter(handle, fieldnames=image_metadata_fields)
+                writer.writeheader()
+                writer.writerows(image_metadata_rows)
         merged_metadata = {
             "dataset_type": "video_set",
             "dataset_instance_id": str(uuid.uuid4()),
@@ -263,6 +366,10 @@ def merge_frame_datasets(
             "sample_fps": expected_recipe[0],
             "max_frames": expected_recipe[1],
             "jpeg_quality": expected_recipe[2],
+            "sharpness_window_seconds": expected_recipe[3],
+            "sharpness_keep_ratio": expected_recipe[4],
+            "sharpness_drop_ratio": expected_recipe[5],
+            "sharpness_drop_raw_floor": expected_recipe[6],
         }
         (temporary / "metadata.json").write_text(
             json.dumps(merged_metadata, indent=2) + "\n",
@@ -275,6 +382,8 @@ def merge_frame_datasets(
 
     print(f"Merged {len(sources)} frame datasets into {output}")
     print(f"Frames: {total_selected_frames}")
+    if image_metadata_fields is not None:
+        print(f"Per-image metadata: {output / IMAGE_METADATA_FILE}")
     print(f"Images: {output / 'images'}")
     print(f"Metadata: {output / 'metadata.json'}")
     return output

@@ -7,7 +7,7 @@ import unittest
 import uuid
 from pathlib import Path
 
-from scripts.sample_bootstrap_frames import (
+from archive.scripts.sample_bootstrap_frames import (
     build_parser,
     consecutive_midpoints,
     sample_bootstrap_frames,

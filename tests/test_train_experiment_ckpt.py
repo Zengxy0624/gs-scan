@@ -85,5 +85,46 @@ class RenderTrajFromCheckpointTests(unittest.TestCase):
         self.assertEqual(runner.rendered_at, 7)
 
 
+class ViewOnlyTests(unittest.TestCase):
+    def test_experiment_config_defaults_to_render_mode(self) -> None:
+        cfg = te.ExperimentConfig()
+        self.assertFalse(cfg.view_only)
+        self.assertEqual(cfg.port, 8080)
+        self.assertIsNone(cfg.ckpt)
+
+    def test_serve_viewer_restores_checkpoint_and_waits(self) -> None:
+        ckpt = {"step": 119999, "splats": {"means": "m", "opacities": "o"}, "app_module": {"w": 1}}
+        runner = FakeRunner(with_app=True)
+        completed = []
+        runner.viewer = types.SimpleNamespace(complete=lambda: completed.append(True))
+        cfg = types.SimpleNamespace(ckpt=["ckpt.pt"], disable_viewer=False, port=8090)
+        sleeps: list[float] = []
+
+        def fake_sleep(seconds: float) -> None:
+            sleeps.append(seconds)
+            raise KeyboardInterrupt  # end the wait loop in the test
+
+        fake_torch = types.SimpleNamespace(load=lambda *a, **k: ckpt, cat=lambda tensors: ("cat", tuple(tensors)))
+        fake_scene = types.SimpleNamespace(splats={"means": FakeParam(1)})
+        fake_st = types.SimpleNamespace(
+            GaussianScene=types.SimpleNamespace(from_splats=lambda splats, id: fake_scene),
+            Stage=lambda: types.SimpleNamespace(add_scene=lambda *a, **k: None),
+        )
+        with patch.object(te, "torch", fake_torch), patch.object(te, "st", fake_st):
+            with self.assertRaises(KeyboardInterrupt):
+                te._serve_viewer_from_checkpoint(runner, cfg, sleep=fake_sleep)
+
+        self.assertEqual(completed, [True])
+        self.assertEqual(runner.app_loaded, {"w": 1})
+        self.assertIsNone(runner.rendered_at)
+        self.assertEqual(sleeps, [3600])
+
+    def test_serve_viewer_refuses_when_viewer_disabled(self) -> None:
+        runner = FakeRunner(with_app=False)
+        cfg = types.SimpleNamespace(ckpt=["ckpt.pt"], disable_viewer=True, port=8080)
+        with self.assertRaisesRegex(RuntimeError, "view-only"):
+            te._serve_viewer_from_checkpoint(runner, cfg, sleep=lambda s: None)
+
+
 if __name__ == "__main__":
     unittest.main()

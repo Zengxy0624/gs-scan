@@ -7,7 +7,7 @@ import unittest
 import uuid
 from pathlib import Path
 
-from scripts.build_run_manifest import (
+from archive.scripts.build_run_manifest import (
     build_manifest,
     build_parser,
     manifest_identity_matches,

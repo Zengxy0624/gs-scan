@@ -419,6 +419,9 @@ def validate_cache(
     feature_max_num_features: int | None = None,
     init_min_tri_angle: float | None = None,
     vocab_tree: Path | None = None,
+    sharpness_window: float | None = None,
+    sharpness_keep_ratio: float | None = None,
+    sharpness_drop_ratio: float | None = None,
 ) -> None:
     dataset = dataset.expanduser().resolve()
     metadata_path = dataset / "metadata.json"
@@ -441,6 +444,52 @@ def validate_cache(
         raise ValueError("cached sample_fps does not match this run")
     if metadata.get("max_frames") != max_frames:
         raise ValueError("cached max_frames does not match this run")
+    if sharpness_window is not None:
+        # Caches extracted before the option existed recorded no window (= 0).
+        recorded_window = metadata.get("sharpness_window_seconds", 0.0)
+        if (
+            isinstance(recorded_window, bool)
+            or not isinstance(recorded_window, (int, float))
+            or not math.isclose(
+                float(recorded_window),
+                sharpness_window,
+                rel_tol=0.0,
+                abs_tol=1e-9,
+            )
+        ):
+            raise ValueError(
+                "cached sharpness_window_seconds does not match this run"
+            )
+    if sharpness_keep_ratio is not None:
+        recorded_ratio = metadata.get("sharpness_keep_ratio", 0.0)
+        if (
+            isinstance(recorded_ratio, bool)
+            or not isinstance(recorded_ratio, (int, float))
+            or not math.isclose(
+                float(recorded_ratio),
+                sharpness_keep_ratio,
+                rel_tol=0.0,
+                abs_tol=1e-9,
+            )
+        ):
+            raise ValueError(
+                "cached sharpness_keep_ratio does not match this run"
+            )
+    if sharpness_drop_ratio is not None:
+        recorded_drop = metadata.get("sharpness_drop_ratio", 0.0)
+        if (
+            isinstance(recorded_drop, bool)
+            or not isinstance(recorded_drop, (int, float))
+            or not math.isclose(
+                float(recorded_drop),
+                sharpness_drop_ratio,
+                rel_tol=0.0,
+                abs_tol=1e-9,
+            )
+        ):
+            raise ValueError(
+                "cached sharpness_drop_ratio does not match this run"
+            )
 
     actual_sources = _normalize_sources(source)
     dataset_type = metadata.get("dataset_type")
@@ -716,6 +765,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--feature-max-num-features", type=int)
     parser.add_argument("--init-min-tri-angle", type=float)
     parser.add_argument("--vocab-tree", type=Path)
+    parser.add_argument("--sharpness-window", type=float)
+    parser.add_argument("--sharpness-keep-ratio", type=float)
+    parser.add_argument("--sharpness-drop-ratio", type=float)
     parser.add_argument("--require-colmap", action="store_true")
     return parser
 
@@ -743,6 +795,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             feature_max_num_features=args.feature_max_num_features,
             init_min_tri_angle=args.init_min_tri_angle,
             vocab_tree=args.vocab_tree,
+            sharpness_window=args.sharpness_window,
+            sharpness_keep_ratio=args.sharpness_keep_ratio,
+            sharpness_drop_ratio=args.sharpness_drop_ratio,
         )
     except (json.JSONDecodeError, OSError, TypeError, ValueError) as error:
         print(f"error: {error}", file=sys.stderr)

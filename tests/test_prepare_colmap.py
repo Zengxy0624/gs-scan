@@ -31,6 +31,8 @@ class InputValidationTests(unittest.TestCase):
         self.assertIsNone(args.feature_max_image_size)
         self.assertIsNone(args.feature_max_num_features)
         self.assertIsNone(args.init_min_tri_angle)
+        self.assertFalse(args.feature_gpu)
+        self.assertEqual(args.feature_gpu_index, "0")
 
     def test_requires_images(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -326,6 +328,8 @@ class OrchestrationTests(unittest.TestCase):
                         "ba_global_max_num_iterations": 50,
                     },
                     "ba_use_gpu": False,
+                    "feature_device": "cpu",
+                    "feature_gpu_index": None,
                     "reused_matches": False,
                     "resumed_from_model": None,
                     "snapshot_frames_freq": 0,
@@ -351,6 +355,143 @@ class OrchestrationTests(unittest.TestCase):
                     "status": "passed",
                 },
             )
+
+    def test_feature_gpu_moves_extraction_and_matching_to_cuda(self) -> None:
+        calls: list[tuple[str, dict[str, object]]] = []
+        reconstruction = FakeReconstruction(registered=10, points=50)
+
+        class BasicOptions:
+            def __init__(self, **kwargs: object) -> None:
+                self.kwargs = kwargs
+
+        class FeatureExtractionOptions:
+            def __init__(self, **kwargs: object) -> None:
+                self.kwargs = kwargs
+                self.gpu_index = "-1"
+                self.sift = types.SimpleNamespace(max_num_features=8192)
+
+        class FeatureMatchingOptions:
+            def __init__(self, **kwargs: object) -> None:
+                self.kwargs = kwargs
+                self.gpu_index = "-1"
+                self.guided_matching = False
+
+        def record(name: str, result: object = None):
+            def function(**kwargs: object) -> object:
+                calls.append((name, kwargs))
+                return result
+
+            return function
+
+        fake_pycolmap = types.SimpleNamespace(
+            __version__="test",
+            has_cuda=True,
+            CameraMode=types.SimpleNamespace(SINGLE="single"),
+            Device=types.SimpleNamespace(cpu="cpu", cuda="cuda"),
+            ImageReaderOptions=BasicOptions,
+            SequentialPairingOptions=BasicOptions,
+            FeatureExtractionOptions=FeatureExtractionOptions,
+            FeatureMatchingOptions=FeatureMatchingOptions,
+            IncrementalPipelineOptions=BasicOptions,
+            extract_features=record("extract_features"),
+            match_sequential=record("match_sequential"),
+            incremental_mapping=record("incremental_mapping", {0: reconstruction}),
+        )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            dataset = Path(temporary).resolve()
+            images = dataset / "images"
+            images.mkdir()
+            for index in range(12):
+                (images / f"{index:06d}.jpg").write_bytes(b"image")
+
+            with patch.dict(sys.modules, {"pycolmap": fake_pycolmap}):
+                reconstruct(
+                    dataset,
+                    overlap=9,
+                    camera_model="OPENCV",
+                    num_threads=4,
+                    feature_gpu=True,
+                    feature_gpu_index="0",
+                )
+
+            extract_call = calls[0][1]
+            self.assertEqual(extract_call["device"], "cuda")
+            self.assertEqual(extract_call["extraction_options"].gpu_index, "0")
+            match_call = calls[1][1]
+            self.assertEqual(match_call["device"], "cuda")
+            self.assertEqual(
+                match_call["matching_options"].kwargs,
+                {"num_threads": 4, "use_gpu": True},
+            )
+            self.assertEqual(match_call["matching_options"].gpu_index, "0")
+            with (dataset / "reconstruction_stats.json").open(encoding="utf-8") as handle:
+                stats = json.load(handle)
+            self.assertEqual(stats["feature_device"], "cuda")
+            self.assertEqual(stats["feature_gpu_index"], "0")
+            self.assertFalse(stats["ba_use_gpu"])
+
+            # a CPU-only pycolmap refuses --feature-gpu instead of silently running on CPU
+            cpu_only = types.SimpleNamespace(**{**vars(fake_pycolmap), "has_cuda": False})
+            fresh = dataset / "fresh"
+            (fresh / "images").mkdir(parents=True)
+            for index in range(2):
+                (fresh / "images" / f"{index:06d}.jpg").write_bytes(b"image")
+            with patch.dict(sys.modules, {"pycolmap": cpu_only}), self.assertRaisesRegex(
+                RuntimeError, "CUDA-enabled pycolmap"
+            ):
+                reconstruct(fresh, overlap=9, camera_model="OPENCV", feature_gpu=True)
+
+    def test_extract_features_retries_without_camera_model_for_pycolmap_4(self) -> None:
+        calls: list[dict[str, object]] = []
+        reconstruction = FakeReconstruction(registered=10, points=50)
+
+        class BasicOptions:
+            def __init__(self, **kwargs: object) -> None:
+                self.kwargs = kwargs
+
+        def extract_features(**kwargs: object) -> None:
+            calls.append(dict(kwargs))
+            if "camera_model" in kwargs:
+                raise TypeError(
+                    "extract_features(): incompatible function arguments. The "
+                    "following argument types are supported: ..."
+                )
+
+        def record(result: object = None):
+            def function(**kwargs: object) -> object:
+                return result
+
+            return function
+
+        fake_pycolmap = types.SimpleNamespace(
+            __version__="4.x",
+            CameraMode=types.SimpleNamespace(SINGLE="single"),
+            Device=types.SimpleNamespace(cpu="cpu"),
+            ImageReaderOptions=BasicOptions,
+            SequentialPairingOptions=BasicOptions,
+            FeatureExtractionOptions=BasicOptions,
+            FeatureMatchingOptions=BasicOptions,
+            IncrementalPipelineOptions=BasicOptions,
+            extract_features=extract_features,
+            match_sequential=record(),
+            incremental_mapping=record({0: reconstruction}),
+        )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            dataset = Path(temporary).resolve()
+            images = dataset / "images"
+            images.mkdir()
+            for index in range(3):
+                (images / f"{index:06d}.jpg").write_bytes(b"image")
+            with patch.dict(sys.modules, {"pycolmap": fake_pycolmap}):
+                reconstruct(dataset, overlap=2, camera_model="OPENCV")
+
+        self.assertEqual(len(calls), 2)
+        self.assertIn("camera_model", calls[0])
+        self.assertNotIn("camera_model", calls[1])
+        self.assertEqual(calls[1]["reader_options"].kwargs, {"camera_model": "OPENCV"})
+        self.assertEqual(calls[1]["camera_mode"], "single")
 
     def test_exhaustive_matching_uses_cpu_and_skips_sequential_pairing(
         self,

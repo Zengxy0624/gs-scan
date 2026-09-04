@@ -30,10 +30,13 @@ import uuid
 from pathlib import Path
 from typing import Sequence
 
-try:
-    from scripts.merge_frame_datasets import _validate_source_identity
-except ImportError:  # Direct execution puts scripts/ itself on sys.path.
-    from merge_frame_datasets import _validate_source_identity
+# Archived under archive/: put the repo root on sys.path so the shared
+# helpers that stayed in scripts/ resolve under direct execution too.
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from scripts.merge_frame_datasets import _validate_source_identity  # noqa: E402
 
 
 _SAMPLE_NAME_PATTERN = re.compile(r"(?P<prefix>.+_)(?P<position>\d{6})\.jpg")

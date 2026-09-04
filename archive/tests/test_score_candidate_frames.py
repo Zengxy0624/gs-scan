@@ -11,7 +11,7 @@ from types import SimpleNamespace
 
 import numpy as np
 
-from scripts.score_candidate_frames import (
+from archive.scripts.score_candidate_frames import (
     CSV_FIELDS,
     affine_fit,
     apply_affine,

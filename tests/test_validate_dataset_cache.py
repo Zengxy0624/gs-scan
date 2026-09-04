@@ -538,6 +538,58 @@ class DatasetCacheValidationTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "frame set"):
                 validate_cache(single, source, 6.0, 100000)
 
+    def test_sharpness_window_defaults_to_zero_for_legacy_caches(self) -> None:
+        args = build_parser().parse_args(
+            ["dataset", "clip.mov", "--sample-fps", "3", "--max-frames", "10",
+             "--sharpness-window", "0.3"]
+        )
+        self.assertEqual(args.sharpness_window, 0.3)
+        self.assertIsNone(
+            build_parser()
+            .parse_args(["dataset", "clip.mov", "--sample-fps", "3", "--max-frames", "10"])
+            .sharpness_window
+        )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "clip.mov"
+            source.write_bytes(b"video")
+            dataset = root / "dataset"
+            create_numbered_images(dataset / "images", 2)
+            identity = source_metadata(source)
+            metadata = {
+                "dataset_type": "single_video",
+                "dataset_instance_id": str(uuid.uuid4()),
+                "source_video": identity["path"],
+                "source_size_bytes": identity["size_bytes"],
+                "source_mtime_ns": identity["mtime_ns"],
+                "source_sha256": identity["sha256"],
+                "images_sha256": numbered_images_digest(2),
+                "sample_fps": 3.0,
+                "max_frames": 10,
+                "selected_indices": [0, 10],
+            }
+            (dataset / "metadata.json").write_text(json.dumps(metadata))
+
+            validate_cache(dataset, source, sample_fps=3.0, max_frames=10)
+            validate_cache(
+                dataset, source, sample_fps=3.0, max_frames=10, sharpness_window=0.0
+            )
+            with self.assertRaisesRegex(ValueError, "sharpness_window_seconds"):
+                validate_cache(
+                    dataset, source, sample_fps=3.0, max_frames=10, sharpness_window=0.3
+                )
+
+            metadata["sharpness_window_seconds"] = 0.3
+            (dataset / "metadata.json").write_text(json.dumps(metadata))
+            validate_cache(
+                dataset, source, sample_fps=3.0, max_frames=10, sharpness_window=0.3
+            )
+            with self.assertRaisesRegex(ValueError, "sharpness_window_seconds"):
+                validate_cache(
+                    dataset, source, sample_fps=3.0, max_frames=10, sharpness_window=0.0
+                )
+
     def test_rejects_old_or_parameter_mismatched_cache(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

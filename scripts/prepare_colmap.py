@@ -229,6 +229,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="GPU index for --ba-use-gpu (default: 0).",
     )
     parser.add_argument(
+        "--feature-gpu",
+        action="store_true",
+        help=(
+            "Run SIFT extraction and feature matching on a GPU (needs a "
+            "CUDA-enabled pycolmap; retrieval and mapping stay on the CPU)."
+        ),
+    )
+    parser.add_argument(
+        "--feature-gpu-index",
+        default="0",
+        help="GPU index for --feature-gpu (default: 0).",
+    )
+    parser.add_argument(
         "--mapping-blas-threads",
         type=int,
         default=48,
@@ -436,6 +449,24 @@ def _effective_nested_option(
     return getattr(nested, name, fallback)
 
 
+def _call_dropping_unsupported(function, optional: Sequence[str], **kwargs):
+    """Call a pycolmap binding, retrying without keywords older/newer builds lack.
+
+    pycolmap 3.x ``extract_features`` takes ``camera_model`` directly while
+    4.x reads it from ``reader_options`` only; pybind reports the mismatch as
+    a TypeError naming the accepted signature.
+    """
+    try:
+        return function(**kwargs)
+    except TypeError as error:
+        present = [key for key in optional if key in kwargs]
+        if not present or "incompatible function arguments" not in str(error):
+            raise
+        for key in present:
+            kwargs.pop(key)
+        return function(**kwargs)
+
+
 def _raise_blas_threads_for_mapping(threads: int) -> None:
     """Give the LD_PRELOAD-ed pthread OpenBLAS its threads back for mapping.
 
@@ -509,6 +540,8 @@ def reconstruct(
     mapping_blas_threads: int = 48,
     ba_use_gpu: bool = False,
     ba_gpu_index: str = "0",
+    feature_gpu: bool = False,
+    feature_gpu_index: str = "0",
 ) -> Path:
     if num_threads == 0 or num_threads < -1:
         raise ValueError("--num-threads must be -1 or a positive integer")
@@ -593,8 +626,23 @@ def reconstruct(
     sparse_path.mkdir(parents=True, exist_ok=True)
 
     print(f"PyCOLMAP {pycolmap.__version__}")
+    if feature_gpu and not (
+        getattr(pycolmap, "has_cuda", False) and hasattr(pycolmap.Device, "cuda")
+    ):
+        raise RuntimeError(
+            "--feature-gpu needs a CUDA-enabled pycolmap (this interpreter's "
+            "pycolmap reports has_cuda=False)"
+        )
+    feature_device = pycolmap.Device.cuda if feature_gpu else pycolmap.Device.cpu
     reader_options = pycolmap.ImageReaderOptions(camera_model=camera_model)
     extraction_options = pycolmap.FeatureExtractionOptions(num_threads=num_threads)
+    if feature_gpu:
+        if hasattr(extraction_options, "use_gpu"):
+            extraction_options.use_gpu = True
+        for holder in (extraction_options, getattr(extraction_options, "sift", None)):
+            if holder is not None and hasattr(holder, "gpu_index"):
+                holder.gpu_index = feature_gpu_index
+        print(f"SIFT extraction and matching on GPU {feature_gpu_index}")
     if feature_max_image_size is not None:
         extraction_options.max_image_size = feature_max_image_size
     if feature_max_num_features is not None:
@@ -610,20 +658,24 @@ def reconstruct(
         )
     else:
         print(f"Extracting features from {len(images)} images in {image_dir}")
-        pycolmap.extract_features(
+        _call_dropping_unsupported(
+            pycolmap.extract_features,
+            ("camera_model",),
             database_path=database_path,
             image_path=image_dir,
             camera_mode=pycolmap.CameraMode.SINGLE,
             camera_model=camera_model,
             reader_options=reader_options,
             extraction_options=extraction_options,
-            device=pycolmap.Device.cpu,
+            device=feature_device,
         )
 
     matching_options = pycolmap.FeatureMatchingOptions(
         num_threads=num_threads,
-        use_gpu=False,
+        use_gpu=feature_gpu,
     )
+    if feature_gpu and hasattr(matching_options, "gpu_index"):
+        matching_options.gpu_index = feature_gpu_index
     matching_options.guided_matching = guided_matching
     vocab_tree_stats: dict[str, object] | None = None
     if matching_strategy == "sequential":
@@ -640,7 +692,7 @@ def reconstruct(
                 database_path=database_path,
                 pairing_options=pairing_options,
                 matching_options=matching_options,
-                device=pycolmap.Device.cpu,
+                device=feature_device,
             )
     elif matching_strategy == "exhaustive":
         if not reuse_matches:
@@ -648,7 +700,7 @@ def reconstruct(
             pycolmap.match_exhaustive(
                 database_path=database_path,
                 matching_options=matching_options,
-                device=pycolmap.Device.cpu,
+                device=feature_device,
             )
     else:
         vocab_tree_kwargs: dict[str, object] = {
@@ -717,7 +769,7 @@ def reconstruct(
                 database_path=database_path,
                 pairing_options=pairing_options,
                 matching_options=matching_options,
-                device=pycolmap.Device.cpu,
+                device=feature_device,
             )
 
     print(f"Running incremental structure-from-motion with threads={num_threads}")
@@ -880,6 +932,8 @@ def reconstruct(
             ),
         },
         "ba_use_gpu": ba_use_gpu,
+        "feature_device": "cuda" if feature_gpu else "cpu",
+        "feature_gpu_index": feature_gpu_index if feature_gpu else None,
         "reused_matches": reuse_matches,
         "resumed_from_model": (
             str(resume_model_path) if resume_model_path is not None else None
@@ -992,6 +1046,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             args.mapping_blas_threads,
             args.ba_use_gpu,
             args.ba_gpu_index,
+            args.feature_gpu,
+            args.feature_gpu_index,
         )
     except (ImportError, OSError, RuntimeError, ValueError) as error:
         print(f"error: {error}", file=sys.stderr)

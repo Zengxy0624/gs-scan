@@ -20,24 +20,20 @@ import tempfile
 from pathlib import Path
 from typing import Sequence
 
-try:
-    from merge_frame_datasets import _link_or_copy
-    from prepare_colmap import (
-        _effective_nested_option,
-        _effective_option,
-        _file_identity,
-        _raise_blas_threads_for_mapping,
-        _write_reconstruction_stats,
-    )
-except ImportError:  # imported as scripts.register_new_frames
-    from scripts.merge_frame_datasets import _link_or_copy
-    from scripts.prepare_colmap import (
-        _effective_nested_option,
-        _effective_option,
-        _file_identity,
-        _raise_blas_threads_for_mapping,
-        _write_reconstruction_stats,
-    )
+# Archived under archive/: put the repo root on sys.path so the shared
+# helpers that stayed in scripts/ resolve under direct execution too.
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from scripts.merge_frame_datasets import _link_or_copy  # noqa: E402
+from scripts.prepare_colmap import (  # noqa: E402
+    _effective_nested_option,
+    _effective_option,
+    _file_identity,
+    _raise_blas_threads_for_mapping,
+    _write_reconstruction_stats,
+)
 
 
 DEFAULT_VOCAB_TREE_NUM_IMAGES = 50
@@ -83,7 +79,7 @@ def _enforce_matching_thread_env() -> None:
         f"relaunch as: LD_PRELOAD={shim} "
         f"LD_LIBRARY_PATH={OPENBLAS_SHIM_RELATIVE} OPENBLAS_NUM_THREADS=1 "
         f"OMP_NUM_THREADS={MATCHING_OMP_THREADS} python "
-        "scripts/register_new_frames.py ... (all on one line; these must be "
+        "archive/scripts/register_new_frames.py ... (all on one line; these must be "
         "set at process launch)"
     )
     if OPENBLAS_SHIM_BASENAME not in os.environ.get("LD_PRELOAD", ""):
