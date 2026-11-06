@@ -49,17 +49,20 @@ bash scripts/build_gpu_colmap.sh       # GPU bundle adjustment (tmux, ~15 min)
 loginctl enable-linger                 # tmux survives logout
 ```
 
-## Run one object
+## Run one video
 
 ```bash
-tmux new -s back
-bash scripts/run_object_pipeline.sh --project jump_center --name mannequin_back --gpu 2 \
-  JC_13_1341 JC_14_1343 JC_15_1344 JC_16_1347 JC_17_1349 JC_18_1351 JC_19_1354
+tmux new -s <clip>
+bash scripts/gs_from_video.sh <project> <clip> <gpu>
 ```
 
-Frames in minutes, COLMAP in hours, training ~4 h; results under
-`outputs/jump_center/mannequin_back_exp1/`. Details and the by-hand commands:
-`docs/OBJECT_PIPELINE.md`.
+Put the video at `captures/<project>/<clip>.MOV` and its row in
+`captures/<project>/annotation.csv`. Frames, COLMAP (global mapping) and
+training run in one go; the PLY lands in `outputs/<project>/<clip>/ply/`.
+COLMAP takes ~10 min for 300 frames and ~50 min for 1,400; training ~1 h on
+an RTX PRO 6000 (2–3 h on an RTX 4090). The recipe and its four differences
+from the production one: `docs/OBJECT_PIPELINE.md` §8. Several clips of one
+object with the production recipe: `scripts/run_object_pipeline.sh` (§6).
 
 ## Tests
 
