@@ -206,7 +206,8 @@ bash scripts/run_object_pipeline.sh --project jump_center --name mannequin_back 
 videos in `captures/<project>/`, add their rows to `annotation.csv`, pass the
 stems. A single-clip object (`prepare_object_frames.sh` needs two) is
 prepared by hand: `extract_frames.py` → `filter_frame_cache.py` →
-`annotate_frame_cache.py`, then `run_object_colmap.sh --dataset <cache>`.
+`annotate_frame_cache.py`, then `run_object_colmap.sh --dataset <cache>`; or
+run it end to end with `gs_from_video.sh` (§8).
 
 ## 7. Conventions
 
@@ -218,3 +219,68 @@ prepared by hand: `extract_frames.py` → `filter_frame_cache.py` →
 - Every script has `--dry-run` and a `tests/test_<stem>.py`; run the suite
   with `third-party/gsplat/.venv/bin/python -m unittest discover -s tests`.
 - Record every finished dataset/run in `docs/EXPERIMENTS.md`.
+
+## 8. Single video (`gs_from_video.sh`)
+
+```bash
+tmux new -s <clip>
+bash scripts/gs_from_video.sh <project> <clip> <gpu>
+```
+
+One clip (`captures/<project>/<clip>.MOV` plus its `annotation.csv` row) runs
+end to end into `work/<project>/<clip>/` and `outputs/<project>/<clip>/`.
+Frames use §2's settings (steps 1–3, no merge); COLMAP runs as CLI commands of
+the cuDSS build with §3's extraction and matching settings. It differs from
+the production recipe in four places:
+
+| | production (§3–4) | `gs_from_video.sh` | why |
+|---|---|---|---|
+| mapping | incremental | `global_mapper` (GLOMAP), COLMAP defaults | 1,393 frames, same matches: 37 min vs 7 h 11 min, all registered in one model; per-frame pose difference median 0.62 mm / 0.027°, P99 3.8 mm / 0.26° (metric scale from a robot arm in the scene) |
+| Gaussian budget | 6.5 M | 1 M | the splat is rendered at every simulation step |
+| `--app-opt` | on | off | real2sim-eval's `GSProcessor` reads SH degree 3 only and cannot load the PLY it exports; exposure is locked during capture |
+| `--pose-opt` | off | on | refines the COLMAP poses of the training frames |
+
+After mapping the script requires exactly one model with ≥ 80 % of the frames
+registered, then writes `colmap_global.txt` (recipe + model checksums); a rerun
+reuses COLMAP only when it matches. COLMAP threads = min(32, available RAM /
+2.5 GB): CPU affine + DSP-SIFT at 4K peaks at ~1.9 GB per thread.
+
+Failure modes seen:
+
+- **Misplaced cameras.** In symmetric scenes, or in frames that see almost no
+  texture, a few frames land in the wrong place and neither the registration
+  count nor the mean reprojection error shows it (1,393 frames: incremental
+  mapping flipped 8 frames by ~180°, global mapping misplaced 1 frame holding
+  6 points). One camera placed at 683× the median distance (a frame showing
+  only a black cloth and a white object) made gsplat's scene scale 698 instead
+  of 2.6–2.8 and training diverged (held-out PSNR 16.4 dB); a dataset without
+  the 59 frames holding < 50 points trained to 26.7 dB. The gate above does
+  not catch this: before training, check the max / median camera distance
+  from the centre (normal < 2) and the points per frame.
+- **Held-out scores with `--pose-opt`.** Only training frames get refined
+  poses; every 8th (eval) frame keeps its COLMAP pose, so PSNR / LPIPS read
+  low and are not comparable to runs without pose optimisation.
+- **Stopping training early.** `--steps-scaler 4` also multiplies
+  `--eval-steps` / `--save-steps` / `--ply-steps`; with 30000 they fire only at
+  the last step, so a run stopped midway leaves no checkpoint or PLY (1 M
+  Gaussians: ~1 h on an idle RTX PRO 6000).
+
+Environment notes (any entry point):
+
+- **No visible GPU at install time** (e.g. a cluster login node): fused-ssim's
+  `setup.py` ignores `TORCH_CUDA_ARCH_LIST` and reads only
+  `CUDA_ARCHITECTURES` or the detected GPU; with neither it builds sm_75/80/89
+  and training elsewhere fails with "no kernel image". Set
+  `CUDA_ARCHITECTURES` (120 for RTX PRO 6000, 80 for A100) and check with
+  `cuobjdump --list-elf`.
+- **Ubuntu 22.04.** The vendored OpenBLAS shim is the 24.04 package (needs
+  GLIBC 2.38): regenerate it from the local apt packages as its README says
+  (22.04 gives OpenBLAS 0.3.20 pthread, `MAX_THREADS=64`; check with
+  `tests/test_openblas_shim.py`). nvcc 13.3 / 13.4 cannot compile the torch
+  2.9.1 extensions (`List_inl.h:201`: need 'typename'); run `setup_gsplat.sh`
+  with `CUDA_HOME` and `PATH` pointing at a 13.0 toolkit. micromamba may
+  detect the driver's CUDA as 11.8, and `build_gpu_colmap.sh` then cannot
+  solve its environment; prefix `CONDA_OVERRIDE_CUDA=<driver CUDA, e.g. 13.2>`.
+- **Vocabulary tree.** Download
+  `vocab_tree_faiss_flickr100K_words256K.bin` to `work/_colmap_cuda/` by hand;
+  the built-in downloader fails.

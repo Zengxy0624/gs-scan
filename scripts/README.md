@@ -27,6 +27,10 @@ retired scripts live in `archive/` and are not listed below.
   `--app-opt` module restored; `--ckpt CKPT --view-only [--port]` serves the
   viser viewer from a checkpoint. Tests: `test_train_experiment_ckpt.py`,
   `test_train_experiment_wandb.py`.
+- `gs_from_video.sh` — one video end to end (`PROJECT CLIP GPU`): stage 1
+  steps without the merge, COLMAP as cuDSS CLI commands with global mapping,
+  training with a 1 M budget, `--pose-opt` and no `--app-opt`
+  (`docs/OBJECT_PIPELINE.md` §8). No `--dry-run` or test yet.
 
 ## Stage building blocks
 
@@ -63,6 +67,9 @@ retired scripts live in `archive/` and are not listed below.
 ## Inspection
 
 - `export_rerun_viz.py` — sparse model + camera poses → `.rrd` for rerun.
+- `export_cameras.py` — COLMAP camera poses (c2w, OpenCV axes) in the frame
+  of the gsplat PLY (gsplat's `Parser`, `normalize=True`) → `cameras.npz`.
+  No test yet.
 
 ## Environment contract (matching runs)
 
