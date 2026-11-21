@@ -255,8 +255,12 @@ Failure modes seen:
   only a black cloth and a white object) made gsplat's scene scale 698 instead
   of 2.6–2.8 and training diverged (held-out PSNR 16.4 dB); a dataset without
   the 59 frames holding < 50 points trained to 26.7 dB. The gate above does
-  not catch this: before training, check the max / median camera distance
-  from the centre (normal < 2) and the points per frame.
+  not catch this, so before training (also on a reused COLMAP result) the
+  script measures each camera's distance from the median camera position and
+  stops, naming the frames, when one is beyond 5× the median distance: the
+  four clean lab datasets read 1.7–2.5, that clip 683 (and three more frames
+  at 5–8×, all holding < 30 points). Then build a dataset without the frames
+  holding few points and run it again.
 - **Held-out scores with `--pose-opt`.** Only training frames get refined
   poses; every 8th (eval) frame keeps its COLMAP pose, so PSNR / LPIPS read
   low and are not comparable to runs without pose optimisation.

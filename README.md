@@ -95,11 +95,10 @@ override those columns of `annotation.csv`.
 
 Frames, the three COLMAP steps and gsplat training run in one go; the PLY
 lands in `outputs/<project>/<clip>/ply/`. The script writes no log and takes
-no lock itself, hence the `tee`. When training starts, check gsplat's
-`Scene scale:` line: our scans gave 1.8–2.2; a camera placed far away by
-COLMAP gave 698 and the run diverged. If it is far above ~3, stop with Ctrl-C
-and see `docs/OBJECT_PIPELINE.md` §8, "Misplaced cameras" (the script's gate,
-one model with ≥ 80 % registered, does not catch it).
+no lock itself, hence the `tee`. Before training it stops if COLMAP placed a
+camera far from the others (beyond 5× the median distance from the centre;
+such a camera made gsplat's scene scale 698 instead of 1.8–2.2 and the run
+diverged): see `docs/OBJECT_PIPELINE.md` §8, "Misplaced cameras".
 
 On a rerun, frames and COLMAP results that still validate are reused. An
 existing `outputs/<project>/<clip>/`, or a `database.db` / `sparse/` left by

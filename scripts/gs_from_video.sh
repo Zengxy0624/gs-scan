@@ -83,6 +83,17 @@ print(f'models {models}, registered {reg}/{n}'); sys.exit(models != ['0'] or reg
 " "${DATASET}"
     marker > "${MARKER}"
 fi
+# A frame mapped far from the others sets gsplat's scene scale and training diverges (docs/OBJECT_PIPELINE.md §8).
+run "${COLMAP_ENV}/bin/python" -c "
+import pathlib, sys, numpy as np, pycolmap
+r = pycolmap.Reconstruction(pathlib.Path(sys.argv[1]) / 'sparse' / '0'); images = [r.image(i) for i in r.reg_image_ids()]
+centres = np.array([i.projection_center() for i in images])
+ratio = np.linalg.norm(centres - np.median(centres, 0), axis=1); ratio /= np.median(ratio)
+print(f'camera distance from the centre, max / median: {ratio.max():.2f}')
+for i in np.flatnonzero(ratio > 5):
+    print(f'error: misplaced camera {images[i].name}: {ratio[i]:.1f} x the median, {images[i].num_points3D} points', file=sys.stderr)
+sys.exit(int(ratio.max() > 5))
+" "${DATASET}"
 
 log "train -> ${RESULT}"
 [[ ! -e "${RESULT}" ]] || { echo "error: ${RESULT} exists; move it aside" >&2; exit 1; }
