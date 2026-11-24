@@ -81,7 +81,7 @@ From the repo root:
 
 ```bash
 tmux new -s <clip>
-mkdir -p work/_logs && PYTHONUNBUFFERED=1 bash scripts/gs_from_video.sh <project> <clip> <gpu> 2>&1 \
+mkdir -p work/_logs && PYTHONUNBUFFERED=1 bash scripts/gs_from_video.sh <project> <clip> <gpu> [fps] 2>&1 \
   | tee -a work/_logs/gs_<clip>.log
 ```
 

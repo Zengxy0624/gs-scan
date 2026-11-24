@@ -9,14 +9,16 @@
 #   - --pose-opt: refines the COLMAP poses of the training frames.
 # Frames and COLMAP that already validate are reused; training refuses an existing result directory.
 #
-#   bash scripts/gs_from_video.sh PROJECT CLIP GPU        # in tmux; needs work/_gpu_colmap (build_gpu_colmap.sh)
+#   bash scripts/gs_from_video.sh PROJECT CLIP GPU [FPS]  # in tmux; needs work/_gpu_colmap (build_gpu_colmap.sh)
+#
+# FPS: frames sampled per second of video (default 3).
 #
 # Reads captures/PROJECT/CLIP.MOV and its row in captures/PROJECT/annotation.csv; writes work/PROJECT/CLIP/ and
 # outputs/PROJECT/CLIP/.
 set -Eeuo pipefail
 
-[[ $# -eq 3 ]] || { echo "usage: $0 PROJECT CLIP GPU" >&2; exit 2; }
-PROJECT="$1"; CLIP="$2"; GPU="$3"
+[[ $# -eq 3 || $# -eq 4 ]] || { echo "usage: $0 PROJECT CLIP GPU [FPS]" >&2; exit 2; }
+PROJECT="$1"; CLIP="$2"; GPU="$3"; FPS="${4:-3}"
 H="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${H}"
 PY="${H}/third-party/gsplat/.venv/bin/python"
@@ -26,7 +28,7 @@ DATASET="${H}/work/${PROJECT}/${CLIP}"
 RESULT="${H}/outputs/${PROJECT}/${CLIP}"
 [[ -f "${VIDEO}" ]] || { echo "error: video not found: ${VIDEO}" >&2; exit 1; }
 
-FRAMES=(--sample-fps 3 --max-frames 100000 --sharpness-window 0.3 --sharpness-keep-ratio 0.8)
+FRAMES=(--sample-fps "${FPS}" --max-frames 100000 --sharpness-window 0.3 --sharpness-keep-ratio 0.8)
 EXTRACT=(--ImageReader.single_camera 1 --ImageReader.camera_model OPENCV --FeatureExtraction.max_image_size 3840
     --SiftExtraction.max_num_features 8192 --SiftExtraction.estimate_affine_shape 1 --SiftExtraction.domain_size_pooling 1
     --FeatureExtraction.use_gpu 1 --FeatureExtraction.gpu_index 0)
